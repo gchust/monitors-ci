@@ -64,60 +64,56 @@ jobs:
           echo "Last processed timestamp: $(cat $GITHUB_OUTPUT | grep last_timestamp | cut -d'=' -f2)"
 
       # Use GitHub CLI (pre-installed) to check events in nocobase/nocobase
-      - name: Check nocobase/nocobase events for new push by Repo B owner
+      - name: Check user events for new push to nocobase/nocobase
         id: check_event
         env:
           GH_TOKEN: ${{ github.token }}
           LAST_TIMESTAMP: ${{ steps.read_state.outputs.last_timestamp }}
-          REPO_B_OWNER: ${{ github.repository_owner }} # Owner of the repo this workflow runs in
-          TARGET_REPO: "nocobase/nocobase" # The repository to monitor
+          # --- User whose events we are polling ---
+          CHECK_USER: ${{ github.repository_owner }}
+          # ----------------------------------------
+          # --- Target repository full name (owner/repo) ---
+          TARGET_REPO_FULLNAME: "nocobase/nocobase"
+          # -------------------------------------------------
         run: |
           LATEST_PUSH_TIMESTAMP=""
           LATEST_PUSH_BRANCH=""
           LATEST_PUSH_SHA=""
           TRIGGER="false"
 
-          # Fetch raw events first for debugging
-          RAW_EVENTS=$(gh api "/repos/${TARGET_REPO}/events?per_page=100")
-          echo "==== RAW API RESPONSE ===="
-          echo "$RAW_EVENTS"
-          echo "==== END RAW API RESPONSE ===="
+          echo "Polling events for user: ${CHECK_USER}"
+          echo "Looking for pushes to repo: ${TARGET_REPO_FULLNAME}"
+          echo "Filtering events newer than: ${LAST_TIMESTAMP}"
 
-          # Ensure REPO_B_OWNER is set
-          if [ -z "$REPO_B_OWNER" ]; then
-            echo "Error: Could not determine Repository B owner (github.repository_owner)."
-            exit 1
-          fi
-          echo "Monitoring for pushes to ${TARGET_REPO} by user: ${REPO_B_OWNER}"
-          echo "Looking for events newer than: ${LAST_TIMESTAMP}"
-
-          # Fetch raw events using gh api (without --jq)
+          # Fetch raw public events performed by CHECK_USER
           # Pipe the raw JSON output to jq for filtering
-          # Use jq's --arg flag to pass shell variables securely
-          LATEST_PUSH_INFO=$(gh api "/repos/${TARGET_REPO}/events?per_page=100" | jq \
-            --arg user "${REPO_B_OWNER}" \
+          # Use jq's --arg flag to pass shell variables
+          LATEST_PUSH_INFO=$(gh api "/users/${CHECK_USER}/events?per_page=100" | jq \
+            --arg user "${CHECK_USER}" \
+            --arg repo_name "${TARGET_REPO_FULLNAME}" \
             --arg last_ts "${LAST_TIMESTAMP}" \
-            '[.[] | select(.type == "PushEvent" and .actor.login == $user and .created_at > $last_ts)] | sort_by(.created_at) | last')
-            # Note: Combined select, sort, and last into one jq expression for efficiency
+            # Filter: Type is PushEvent, Repo name matches TARGET_REPO_FULLNAME, Actor login matches CHECK_USER (redundant but safe), created time is after LAST_TIMESTAMP
+            # Then sort by time and take the most recent one
+            '[.[] | select(.type == "PushEvent" and .repo.name == $repo_name and .actor.login == $user and .created_at > $last_ts)] | sort_by(.created_at) | last')
 
-          echo "Latest push info found by jq: ${LATEST_PUSH_INFO}"
+          echo "Latest matching push info found by jq: ${LATEST_PUSH_INFO}"
 
-          # Check if jq found a valid JSON object (output is not empty or "null")
+          # Check if jq found a valid JSON object
           if [ -n "$LATEST_PUSH_INFO" ] && [ "$LATEST_PUSH_INFO" != "null" ]; then
             LATEST_PUSH_TIMESTAMP=$(echo "$LATEST_PUSH_INFO" | jq -r '.created_at')
-            LATEST_PUSH_REF=$(echo "$LATEST_PUSH_INFO" | jq -r '.ref') # e.g., "refs/heads/main"
+            LATEST_PUSH_REF=$(echo "$LATEST_PUSH_INFO" | jq -r '.ref') # e.g., "refs/heads/some-feature-branch"
             LATEST_PUSH_SHA=$(echo "$LATEST_PUSH_INFO" | jq -r '.sha')
 
-            # Extract branch name only if it's a branch push (starts with 'refs/heads/')
+            # Extract branch name only if it's a branch push
             if [[ "$LATEST_PUSH_REF" == "refs/heads/"* ]]; then
               LATEST_PUSH_BRANCH=${LATEST_PUSH_REF#refs/heads/}
-              echo "New push by ${REPO_B_OWNER} found on branch '${LATEST_PUSH_BRANCH}' at ${LATEST_PUSH_TIMESTAMP} (SHA: ${LATEST_PUSH_SHA})"
+              echo "New push by ${CHECK_USER} to ${TARGET_REPO_FULLNAME} found on branch '${LATEST_PUSH_BRANCH}' at ${LATEST_PUSH_TIMESTAMP} (SHA: ${LATEST_PUSH_SHA})"
               TRIGGER="true"
             else
-              echo "Push event found for ${REPO_B_OWNER} but ref ('${LATEST_PUSH_REF}') is not a branch push, ignoring."
+              echo "Push event found for ${CHECK_USER} to ${TARGET_REPO_FULLNAME} but ref ('${LATEST_PUSH_REF}') is not a branch push, ignoring."
             fi
           else
-            echo "No new push event found for user ${REPO_B_OWNER} in ${TARGET_REPO} since ${LAST_TIMESTAMP}"
+            echo "No new push event found for user ${CHECK_USER} to repo ${TARGET_REPO_FULLNAME} since ${LAST_TIMESTAMP}"
           fi
 
           # Set outputs for the next job
