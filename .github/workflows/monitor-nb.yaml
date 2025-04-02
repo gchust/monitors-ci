@@ -66,9 +66,9 @@ jobs:
       - name: Check nocobase/nocobase events for new push by Repo B owner
         id: check_event
         env:
-          GH_TOKEN: ${{ github.token }} # Use the default token, sufficient for public repo reads
+          GH_TOKEN: ${{ github.token }}
           LAST_TIMESTAMP: ${{ steps.read_state.outputs.last_timestamp }}
-          REPO_B_OWNER: ${{ github.repository_owner }} # Owner of the repo THIS workflow runs in
+          REPO_B_OWNER: ${{ github.repository_owner }} # Owner of the repo this workflow runs in
           TARGET_REPO: "nocobase/nocobase" # The repository to monitor
         run: |
           LATEST_PUSH_TIMESTAMP=""
@@ -76,31 +76,26 @@ jobs:
           LATEST_PUSH_SHA=""
           TRIGGER="false"
 
-          # Fetch raw events first for debugging
-          RAW_EVENTS=$(gh api "/repos/${TARGET_REPO}/events?per_page=100")
-          echo "==== RAW API RESPONSE (first 2000 chars) ===="
-          echo "$RAW_EVENTS" | head -c 2000
-          echo "==== END RAW API RESPONSE ===="
-
           # Ensure REPO_B_OWNER is set
           if [ -z "$REPO_B_OWNER" ]; then
             echo "Error: Could not determine Repository B owner (github.repository_owner)."
             exit 1
           fi
           echo "Monitoring for pushes to ${TARGET_REPO} by user: ${REPO_B_OWNER}"
+          echo "Looking for events newer than: ${LAST_TIMESTAMP}"
 
-          # Fetch recent events (max 100 per page) from the target repository
-          # Use jq to parse JSON, filter for PushEvents by the Repo B owner that are newer than the last timestamp
-          # Select the most recent matching event
-          LATEST_PUSH_INFO=$(gh api "/repos/${TARGET_REPO}/events?per_page=100" --jq \
+          # Fetch raw events using gh api (without --jq)
+          # Pipe the raw JSON output to jq for filtering
+          # Use jq's --arg flag to pass shell variables securely
+          LATEST_PUSH_INFO=$(gh api "/repos/${TARGET_REPO}/events?per_page=100" | jq \
             --arg user "${REPO_B_OWNER}" \
             --arg last_ts "${LAST_TIMESTAMP}" \
-            '.[] | select(.type == "PushEvent" and .actor.login == $user and .created_at > $last_ts) | {created_at: .created_at, ref: .payload.ref, sha: .payload.head}' | \
-            jq -s 'sort_by(.created_at) | last') # Get the most recent matching push event
+            '[.[] | select(.type == "PushEvent" and .actor.login == $user and .created_at > $last_ts)] | sort_by(.created_at) | last')
+            # Note: Combined select, sort, and last into one jq expression for efficiency
 
           echo "Latest push info found by jq: ${LATEST_PUSH_INFO}"
 
-          # Check if jq found a valid JSON object
+          # Check if jq found a valid JSON object (output is not empty or "null")
           if [ -n "$LATEST_PUSH_INFO" ] && [ "$LATEST_PUSH_INFO" != "null" ]; then
             LATEST_PUSH_TIMESTAMP=$(echo "$LATEST_PUSH_INFO" | jq -r '.created_at')
             LATEST_PUSH_REF=$(echo "$LATEST_PUSH_INFO" | jq -r '.ref') # e.g., "refs/heads/main"
@@ -123,7 +118,7 @@ jobs:
           echo "branch=${LATEST_PUSH_BRANCH}" >> $GITHUB_OUTPUT
           echo "sha=${LATEST_PUSH_SHA}" >> $GITHUB_OUTPUT
           echo "timestamp=${LATEST_PUSH_TIMESTAMP}" >> $GITHUB_OUTPUT
-
+          
       # Save the timestamp of the *newly found* push event as an artifact to prevent reprocessing
       - name: Save latest processed timestamp as artifact
         # Only run this step if a new push was actually found and triggered the process
