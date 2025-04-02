@@ -76,6 +76,12 @@ jobs:
           LATEST_PUSH_SHA=""
           TRIGGER="false"
 
+          # Fetch raw events first for debugging
+          RAW_EVENTS=$(gh api "/repos/${TARGET_REPO}/events?per_page=100")
+          echo "==== RAW API RESPONSE (first 2000 chars) ===="
+          echo "$RAW_EVENTS" | head -c 2000
+          echo "==== END RAW API RESPONSE ===="
+
           # Ensure REPO_B_OWNER is set
           if [ -z "$REPO_B_OWNER" ]; then
             echo "Error: Could not determine Repository B owner (github.repository_owner)."
