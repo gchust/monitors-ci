@@ -79,8 +79,8 @@ jobs:
 
           # Fetch raw events first for debugging
           RAW_EVENTS=$(gh api "/repos/${TARGET_REPO}/events?per_page=100")
-          echo "==== RAW API RESPONSE (first 2000 chars) ===="
-          echo "$RAW_EVENTS" | head -c 2000
+          echo "==== RAW API RESPONSE ===="
+          echo "$RAW_EVENTS"
           echo "==== END RAW API RESPONSE ===="
 
           # Ensure REPO_B_OWNER is set
