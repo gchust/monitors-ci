@@ -1,0 +1,227 @@
+name: Monitor nb for Repo B Owner Pushes & Run E2E
+
+on:
+  schedule:
+    # Runs every 15 minutes. Adjust frequency as needed (minimum is 5 minutes).
+    # Use https://crontab.guru/ to define your schedule.
+    - cron: '*/5 * * * *'
+
+# Set permissions required by the workflow
+permissions:
+  contents: read    # To read repository events (public repo) and checkout code
+  actions: write    # To read/write artifacts for state persistence
+
+# Prevent multiple scheduled runs from overlapping
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  check_for_new_push:
+    name: Check nocobase/nocobase for new push by Repo B owner
+    runs-on: ubuntu-latest
+    outputs:
+      triggered: ${{ steps.check_event.outputs.triggered }}
+      branch: ${{ steps.check_event.outputs.branch }}
+      sha: ${{ steps.check_event.outputs.sha }}
+      timestamp: ${{ steps.check_event.outputs.timestamp }} # Timestamp of the triggering push
+
+    steps:
+      # Checkout Repo B - may not be strictly needed unless you modify Repo B files,
+      # but it doesn't hurt and provides context.
+      - name: Checkout Repo B code
+        uses: actions/checkout@v4
+
+      # Attempt to download the artifact containing the timestamp of the last processed push
+      - name: Download last processed timestamp artifact
+        uses: actions/download-artifact@v4
+        id: download-state
+        with:
+          name: last-repo-b-owner-push-timestamp # Unique artifact name for this workflow's state
+          path: ./state
+        # Continue even if artifact doesn't exist (first run or artifact expired)
+        continue-on-error: true
+
+      # Read the timestamp from the downloaded file, or use a default old date
+      - name: Read last processed timestamp
+        id: read_state
+        run: |
+          if [ -f ./state/timestamp.txt ]; then
+            timestamp=$(cat ./state/timestamp.txt)
+            # Validate timestamp format (ISO 8601 UTC)
+            if [[ "$timestamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+              echo "last_timestamp=$timestamp" >> $GITHUB_OUTPUT
+            else
+              echo "last_timestamp=1970-01-01T00:00:00Z" >> $GITHUB_OUTPUT
+              echo "Warning: Invalid timestamp found in artifact ('$timestamp'), using default."
+            fi
+          else
+            # Default to a very old timestamp if no artifact exists
+            echo "last_timestamp=1970-01-01T00:00:00Z" >> $GITHUB_OUTPUT
+            echo "No previous state found."
+          fi
+          echo "Last processed timestamp: $(cat $GITHUB_OUTPUT | grep last_timestamp | cut -d'=' -f2)"
+
+      # Use GitHub CLI (pre-installed) to check events in nocobase/nocobase
+      - name: Check nocobase/nocobase events for new push by Repo B owner
+        id: check_event
+        env:
+          GH_TOKEN: ${{ github.token }} # Use the default token, sufficient for public repo reads
+          LAST_TIMESTAMP: ${{ steps.read_state.outputs.last_timestamp }}
+          REPO_B_OWNER: ${{ github.repository_owner }} # Owner of the repo THIS workflow runs in
+          TARGET_REPO: "nocobase/nocobase" # The repository to monitor
+        run: |
+          LATEST_PUSH_TIMESTAMP=""
+          LATEST_PUSH_BRANCH=""
+          LATEST_PUSH_SHA=""
+          TRIGGER="false"
+
+          # Ensure REPO_B_OWNER is set
+          if [ -z "$REPO_B_OWNER" ]; then
+            echo "Error: Could not determine Repository B owner (github.repository_owner)."
+            exit 1
+          fi
+          echo "Monitoring for pushes to ${TARGET_REPO} by user: ${REPO_B_OWNER}"
+
+          # Fetch recent events (max 100 per page) from the target repository
+          # Use jq to parse JSON, filter for PushEvents by the Repo B owner that are newer than the last timestamp
+          # Select the most recent matching event
+          LATEST_PUSH_INFO=$(gh api "/repos/${TARGET_REPO}/events?per_page=100" --jq \
+            --arg user "${REPO_B_OWNER}" \
+            --arg last_ts "${LAST_TIMESTAMP}" \
+            '.[] | select(.type == "PushEvent" and .actor.login == $user and .created_at > $last_ts) | {created_at: .created_at, ref: .payload.ref, sha: .payload.head}' | \
+            jq -s 'sort_by(.created_at) | last') # Get the most recent matching push event
+
+          echo "Latest push info found by jq: ${LATEST_PUSH_INFO}"
+
+          # Check if jq found a valid JSON object
+          if [ -n "$LATEST_PUSH_INFO" ] && [ "$LATEST_PUSH_INFO" != "null" ]; then
+            LATEST_PUSH_TIMESTAMP=$(echo "$LATEST_PUSH_INFO" | jq -r '.created_at')
+            LATEST_PUSH_REF=$(echo "$LATEST_PUSH_INFO" | jq -r '.ref') # e.g., "refs/heads/main"
+            LATEST_PUSH_SHA=$(echo "$LATEST_PUSH_INFO" | jq -r '.sha')
+
+            # Extract branch name only if it's a branch push (starts with 'refs/heads/')
+            if [[ "$LATEST_PUSH_REF" == "refs/heads/"* ]]; then
+              LATEST_PUSH_BRANCH=${LATEST_PUSH_REF#refs/heads/}
+              echo "New push by ${REPO_B_OWNER} found on branch '${LATEST_PUSH_BRANCH}' at ${LATEST_PUSH_TIMESTAMP} (SHA: ${LATEST_PUSH_SHA})"
+              TRIGGER="true"
+            else
+              echo "Push event found for ${REPO_B_OWNER} but ref ('${LATEST_PUSH_REF}') is not a branch push, ignoring."
+            fi
+          else
+            echo "No new push event found for user ${REPO_B_OWNER} in ${TARGET_REPO} since ${LAST_TIMESTAMP}"
+          fi
+
+          # Set outputs for the next job
+          echo "triggered=${TRIGGER}" >> $GITHUB_OUTPUT
+          echo "branch=${LATEST_PUSH_BRANCH}" >> $GITHUB_OUTPUT
+          echo "sha=${LATEST_PUSH_SHA}" >> $GITHUB_OUTPUT
+          echo "timestamp=${LATEST_PUSH_TIMESTAMP}" >> $GITHUB_OUTPUT
+
+      # Save the timestamp of the *newly found* push event as an artifact to prevent reprocessing
+      - name: Save latest processed timestamp as artifact
+        # Only run this step if a new push was actually found and triggered the process
+        if: steps.check_event.outputs.triggered == 'true'
+        run: |
+          mkdir -p ./state
+          echo "${{ steps.check_event.outputs.timestamp }}" > ./state/timestamp.txt
+          echo "Saving timestamp for next run: ${{ steps.check_event.outputs.timestamp }}"
+      - uses: actions/upload-artifact@v4
+        if: steps.check_event.outputs.triggered == 'true'
+        with:
+          name: last-repo-b-owner-push-timestamp # Must match the download name
+          path: ./state/timestamp.txt
+          retention-days: 90 # Keep state artifacts for a reasonable time
+
+  run_e2e_tests:
+    name: Run Nocobase E2E Tests
+    needs: check_for_new_push # Depends on the previous job
+    if: needs.check_for_new_push.outputs.triggered == 'true' # Only run if the check job found a new push
+    runs-on: ubuntu-latest
+    container: node:18 # Match the container used in nocobase/e2e.yml for consistency
+    services:
+      # Define the PostgreSQL service needed by nocobase e2e tests
+      postgres:
+        image: postgres:11
+        env:
+          POSTGRES_USER: nocobase
+          POSTGRES_PASSWORD: password
+        # Waits for the service to be ready before starting steps
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      # Checkout the specific commit from nocobase/nocobase that triggered the run
+      - name: Checkout nocobase/nocobase code on specific commit
+        uses: actions/checkout@v4
+        with:
+          repository: nocobase/nocobase # Target repository
+          ref: ${{ needs.check_for_new_push.outputs.sha }} # Checkout the exact commit SHA
+          # No need to specify path or anything about pro-plugins here
+
+      # Setup Node.js environment
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'yarn' # Enable yarn caching based on lockfile
+
+      # Get yarn cache directory path (needed for caching step)
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT # Use GITHUB_OUTPUT
+
+      # Setup caching for yarn dependencies
+      - name: Cache yarn dependencies
+        uses: actions/cache@v4
+        id: yarn-cache # Optional: Cache step ID
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      # Install project dependencies
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      # Build packages as required by E2E tests
+      - name: Build packages
+        run: yarn build
+        env:
+          __E2E__: true # Set environment variable needed during build for E2E
+
+      # Install Playwright browsers required for tests
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+
+      # Execute the E2E tests, using the command adapted from nocobase/e2e.yml
+      # The --ignore pattern excludes pro-plugin tests
+      - name: Run E2E tests (Core and Plugins - adapted)
+        run: yarn e2e p-test --ignore 'packages/**/{plugin-data-source-main,plugin-workflow,plugin-workflow-*}/**/__e2e__/**/*.test.ts'
+        env:
+          # Set environment variables required by the tests
+          __E2E__: true
+          APP_ENV: production
+          LOGGER_LEVEL: error
+          DB_DIALECT: postgres
+          DB_HOST: postgres # Use the service name defined above
+          DB_PORT: 5432
+          DB_USER: nocobase
+          DB_PASSWORD: password
+          DB_DATABASE: nocobase
+          ENCRYPTION_FIELD_KEY: 1%&glK;<UA}aIxJVc53-4G(rTi0vg@J] # Use a placeholder or manage securely if needed for tests
+          # CRITICAL: Do NOT include APPEND_PRESET_LOCAL_PLUGINS or similar pro-plugin vars
+
+      # Optional: Upload E2E test reports as artifacts for review
+      - name: Upload E2E test report artifact
+        # Run this step even if the previous test step failed, to capture failure reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report-${{ needs.check_for_new_push.outputs.branch }}-${{ github.run_id }}
+          path: ./storage/playwright/tests-report-blob/blob-*/* # Path to Playwright reports in nocobase structure
+          retention-days: 7 # Keep reports for 7 days
