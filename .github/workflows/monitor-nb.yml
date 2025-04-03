@@ -6,6 +6,7 @@ on:
     # Use https://crontab.guru/ to define your schedule.
     - cron: '*/5 * * * *'
   workflow_dispatch: # Allows manual triggering from the Actions tab for testing
+  push:
 
 # Set permissions required by the workflow
 permissions:
