@@ -87,7 +87,7 @@ jobs:
           GRAPHQL_QUERY=$(cat <<EOF
           query RecentCommitsByAuthor(\$repoOwner: String!, \$repoName: String!) {
             repository(owner: \$repoOwner, name: \$repoName) {
-              refs(refPrefix: "refs/heads/", first: 30) {
+              refs(refPrefix: "refs/heads/", first: 100) {
                 nodes {
                   name # Branch name
                   target {
