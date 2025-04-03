@@ -40,21 +40,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_NAME: "last-repo-b-owner-commit-timestamp"
         run: |
-          # Find the latest completed run (success, failure, or cancelled) for this workflow
-          echo "Finding latest completed run for workflow: ${{ github.workflow }}"
-          # --- CORRECTED jq command below ---
-          WORKFLOW_ID=$(gh workflow list --limit 1 --json id,name | jq -r '.[] | select(.name=="${{ github.workflow }}") | .id')
+          # --- CORRECTED WAY TO GET WORKFLOW ID ---
+          echo "Finding workflow ID for workflow named: ${{ github.workflow }}"
+          # Try using gh workflow view first (more direct)
+          WORKFLOW_ID=$(gh workflow view "${{ github.workflow }}" --json id -q '.id' 2>/dev/null)
+
+          # Fallback using API list if view command failed or returned empty
           if [ -z "$WORKFLOW_ID" ]; then
-             echo "Could not determine workflow ID for workflow named: ${{ github.workflow }}"
-             # Adding extra debug: list available workflows
-             echo "Available workflows:"
-             gh workflow list --limit 5 --json id,name,path
+            echo "Fallback: Listing workflows via API to find ID for name..."
+            WORKFLOW_ID=$(gh api "/repos/${{ github.repository }}/actions/workflows" --paginate -q \
+              --arg workflow_name "${{ github.workflow }}" \
+              '.workflows[] | select(.name == $workflow_name) | .id // empty' | head -n 1)
+          fi
+
+          # Final check if WORKFLOW_ID is determined
+          if [ -z "$WORKFLOW_ID" ]; then
+             echo "Could not determine workflow ID using name '${{ github.workflow }}'."
+             echo "Available workflows (first 5):"
+             gh workflow list --limit 5 --json id,name,path || echo "Failed to list workflows."
              exit 1
           fi
-          echo "Determined Workflow ID: $WORKFLOW_ID" # Added for confirmation
+          echo "Determined Workflow ID: $WORKFLOW_ID"
+          # --- END OF WORKFLOW ID CORRECTION ---
 
           # Get the ID of the most recent completed run *before* the current one
-          # Note: This assumes runs are listed chronologically and the current run might be first
           echo "Fetching recent runs for workflow ID $WORKFLOW_ID..."
           PREVIOUS_RUN_ID=$(gh api "/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs" --paginate -q \
             --argjson current_run_id ${{ github.run_id }} \
@@ -62,7 +71,6 @@ jobs:
 
           if [ -z "$PREVIOUS_RUN_ID" ]; then
             echo "Could not find a previous completed run."
-            # Set output to indicate no artifact found, similar to download-artifact failing
             echo "artifact_found=false" >> $GITHUB_OUTPUT
             exit 0 # Exit successfully, let the next step handle the default timestamp
           fi
@@ -120,7 +128,7 @@ jobs:
              echo "artifact_found=false" >> $GITHUB_OUTPUT
              # Optionally exit with error: exit 1
           fi
-          
+
       - name: Read last processed timestamp
         id: read_state
         run: |
