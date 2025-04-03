@@ -1,4 +1,3 @@
-# .github/workflows/e2e-tests.yml
 name: Run Nocobase E2E Tests (Triggerable)
 
 on:
