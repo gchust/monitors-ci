@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@v4
 
       # --- State Management (Same as before) ---
-      - name: Download State Artifact via API (v7)
+      - name: Download State Artifact via API (v8 - Final)
         id: manual_download
         env:
           GH_TOKEN: ${{ github.token }}
@@ -48,16 +48,17 @@ jobs:
           API_URL_WF="/repos/${REPO_NAME}/actions/workflows"
 
           echo "Finding workflow ID for workflow named: '${WORKFLOW_NAME_FROM_CONTEXT}' via API..."
-          WF_API_OUTPUT=$(gh api "${API_URL_WF}" --paginate -q)
+          # Step 1: Run gh api, save output. REMOVED -q
+          WF_API_OUTPUT=$(gh api "${API_URL_WF}" --paginate)
           WF_API_EXIT_CODE=$?
 
           if [ $WF_API_EXIT_CODE -ne 0 ]; then
              echo "Error: gh api call for workflows failed (Exit Code: $WF_API_EXIT_CODE)."
-             # Attempt to get raw output for debugging
-             gh api "${API_URL_WF}" --paginate || true
+             gh api "${API_URL_WF}" --paginate || true # Attempt raw output for debugging
              exit 1
           fi
 
+          # Step 2: Run jq on the saved output
           WORKFLOW_ID=$(echo "${WF_API_OUTPUT}" | jq -r --arg workflow_name "${WORKFLOW_NAME_FROM_CONTEXT}" '.workflows[] | select(.name == $workflow_name) | .id // empty' | head -n 1)
           if [ -z "$WORKFLOW_ID" ]; then
              echo "Error: Could not determine workflow ID from API output using jq."
@@ -72,15 +73,17 @@ jobs:
           RUNS_API_URL="/repos/${REPO_NAME}/actions/workflows/${WORKFLOW_ID}/runs"
           CURRENT_RUN_ID=${{ github.run_id }}
 
-          RUNS_API_OUTPUT=$(gh api "${RUNS_API_URL}" --paginate -q)
+          # Step 1: Run gh api, save output. REMOVED -q
+          RUNS_API_OUTPUT=$(gh api "${RUNS_API_URL}" --paginate)
           RUNS_API_EXIT_CODE=$?
 
           if [ $RUNS_API_EXIT_CODE -ne 0 ]; then
              echo "Error: gh api call for runs failed (Exit Code: $RUNS_API_EXIT_CODE)."
-             gh api "${RUNS_API_URL}" --paginate || true # Try without -q for error
+             gh api "${RUNS_API_URL}" --paginate || true # Try raw output for debugging
              exit 1
           fi
 
+          # Step 2: Run jq on the saved output
           PREVIOUS_RUN_ID=$(echo "${RUNS_API_OUTPUT}" | jq -r --argjson current_run_id ${CURRENT_RUN_ID} \
             '.workflow_runs | map(select(.id != $current_run_id and (.status == "completed"))) | sort_by(.created_at) | reverse | .[0].id // empty')
 
@@ -97,12 +100,14 @@ jobs:
           echo "Attempting to find artifact '$ARTIFACT_NAME' in run $PREVIOUS_RUN_ID via REST API:"
           ARTIFACT_API_URL="/repos/${REPO_NAME}/actions/runs/${PREVIOUS_RUN_ID}/artifacts"
 
-          ARTIFACT_API_OUTPUT=$(gh api "${ARTIFACT_API_URL}" -q)
+          # Step 1: Run gh api, save output. REMOVED -q
+          ARTIFACT_API_OUTPUT=$(gh api "${ARTIFACT_API_URL}")
           ARTIFACT_API_EXIT_CODE=$?
 
           # Allow API to fail gracefully if run has no artifacts (might return 404 or empty list)
           ARTIFACT_INFO_JSON=""
           if [ $ARTIFACT_API_EXIT_CODE -eq 0 ]; then
+              # Step 2: Run jq on the saved output
               ARTIFACT_INFO_JSON=$(echo "${ARTIFACT_API_OUTPUT}" | jq -r --arg artifact_name "$ARTIFACT_NAME" '.artifacts[] | select(.name==$artifact_name)')
           else
               echo "Warning: API call to list artifacts returned non-zero exit code $ARTIFACT_API_EXIT_CODE. Assuming no artifacts."
@@ -158,7 +163,7 @@ jobs:
              # exit 1 # Ensure this is commented out
           fi
           # --- End Unzip and Verify ---
-                  
+        
       - name: Read last processed timestamp
         id: read_state
         run: |
