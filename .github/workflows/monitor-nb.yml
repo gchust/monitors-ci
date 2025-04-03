@@ -1,0 +1,337 @@
+name: Monitor nb via GraphQL for Repo Owner Pushes & Run E2E
+
+on:
+  schedule:
+    # Runs every 15 minutes. Adjust frequency as needed (minimum is 5 minutes).
+    # Use https://crontab.guru/ to define your schedule.
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Allows manual triggering from the Actions tab for testing
+  push:
+
+# Set permissions required by the workflow
+permissions:
+  contents: read      # To read repository data via API (public repo) and checkout code
+  actions: write      # To read/write artifacts for state persistence
+
+# Prevent multiple scheduled runs from overlapping
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  check_for_new_commit: # Renamed job slightly for clarity
+    name: Check nocobase/nocobase via GraphQL for new commit by Repo Owner
+    runs-on: ubuntu-latest
+    outputs:
+      triggered: ${{ steps.check_commit.outputs.triggered }}
+      branch: ${{ steps.check_commit.outputs.branch }}
+      sha: ${{ steps.check_commit.outputs.sha }}
+      timestamp: ${{ steps.check_commit.outputs.timestamp }} # Timestamp of the triggering commit (authoredDate)
+
+    steps:
+      # Checkout code of the current repo (where the workflow lives)
+      # Still potentially optional, but harmless.
+      - name: Checkout current repo code
+        uses: actions/checkout@v4
+
+      # --- State Management (Same as before) ---
+      - name: Download State Artifact via API
+        id: manual_download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: "last-repo-b-owner-commit-timestamp"
+        run: |
+          set -e # Ensure script exits immediately on errors
+
+          # --- WORKFLOW_ID Lookup ---
+          WORKFLOW_NAME_FROM_CONTEXT="${{ github.workflow }}"
+          REPO_NAME="${{ github.repository }}"
+          API_URL_WF="/repos/${REPO_NAME}/actions/workflows"
+
+          echo "Finding workflow ID for workflow named: '${WORKFLOW_NAME_FROM_CONTEXT}' via API..."
+          # Step 1: Run gh api, save output. REMOVED -q
+          WF_API_OUTPUT=$(gh api "${API_URL_WF}" --paginate)
+          WF_API_EXIT_CODE=$?
+
+          if [ $WF_API_EXIT_CODE -ne 0 ]; then
+             echo "Error: gh api call for workflows failed (Exit Code: $WF_API_EXIT_CODE)."
+             gh api "${API_URL_WF}" --paginate || true # Attempt raw output for debugging
+             exit 1
+          fi
+
+          # Step 2: Run jq on the saved output
+          WORKFLOW_ID=$(echo "${WF_API_OUTPUT}" | jq -r --arg workflow_name "${WORKFLOW_NAME_FROM_CONTEXT}" '.workflows[] | select(.name == $workflow_name) | .id // empty' | head -n 1)
+          if [ -z "$WORKFLOW_ID" ]; then
+             echo "Error: Could not determine workflow ID from API output using jq."
+             echo "API Output Snippet: $(echo "$WF_API_OUTPUT" | head -c 300)..."
+             exit 1
+          fi
+          echo "Successfully determined Workflow ID: $WORKFLOW_ID"
+          # --- End WORKFLOW_ID ---
+
+          # --- Find Previous Run ID ---
+          echo "Fetching recent runs for workflow ID $WORKFLOW_ID..."
+          RUNS_API_URL="/repos/${REPO_NAME}/actions/workflows/${WORKFLOW_ID}/runs"
+          CURRENT_RUN_ID=${{ github.run_id }}
+
+          # Step 1: Run gh api, save output. REMOVED -q
+          RUNS_API_OUTPUT=$(gh api "${RUNS_API_URL}" --paginate)
+          RUNS_API_EXIT_CODE=$?
+
+          if [ $RUNS_API_EXIT_CODE -ne 0 ]; then
+             echo "Error: gh api call for runs failed (Exit Code: $RUNS_API_EXIT_CODE)."
+             gh api "${RUNS_API_URL}" --paginate || true # Try raw output for debugging
+             exit 1
+          fi
+
+          # Step 2: Run jq on the saved output
+          PREVIOUS_RUN_ID=$(echo "${RUNS_API_OUTPUT}" | jq -r --argjson current_run_id ${CURRENT_RUN_ID} \
+            '.workflow_runs | map(select(.id != $current_run_id and (.status == "completed"))) | sort_by(.created_at) | reverse | .[0].id // empty')
+
+          if [ -z "$PREVIOUS_RUN_ID" ] || [ "$PREVIOUS_RUN_ID" == "null" ]; then
+             echo "Could not find a previous completed run ID from API output using jq."
+             echo "API Output Snippet: $(echo "$RUNS_API_OUTPUT" | head -c 300)..."
+             echo "artifact_found=false" >> $GITHUB_OUTPUT
+             exit 0 # Exit gracefully, no previous state found
+          fi
+          echo "Found previous completed run ID: $PREVIOUS_RUN_ID"
+          # --- End Find Previous Run ID ---
+
+          # --- Find Artifact Info ---
+          echo "Attempting to find artifact '$ARTIFACT_NAME' in run $PREVIOUS_RUN_ID via REST API:"
+          ARTIFACT_API_URL="/repos/${REPO_NAME}/actions/runs/${PREVIOUS_RUN_ID}/artifacts"
+
+          # Step 1: Run gh api, save output. REMOVED -q
+          ARTIFACT_API_OUTPUT=$(gh api "${ARTIFACT_API_URL}")
+          ARTIFACT_API_EXIT_CODE=$?
+
+          # Allow API to fail gracefully if run has no artifacts (might return 404 or empty list)
+          ARTIFACT_INFO_JSON=""
+          if [ $ARTIFACT_API_EXIT_CODE -eq 0 ]; then
+              # Step 2: Run jq on the saved output
+              ARTIFACT_INFO_JSON=$(echo "${ARTIFACT_API_OUTPUT}" | jq -r --arg artifact_name "$ARTIFACT_NAME" '.artifacts[] | select(.name==$artifact_name)')
+          else
+              echo "Warning: API call to list artifacts returned non-zero exit code $ARTIFACT_API_EXIT_CODE. Assuming no artifacts."
+          fi
+
+          if [ -z "$ARTIFACT_INFO_JSON" ] || [ "$ARTIFACT_INFO_JSON" == "[]" ]; then
+             echo "Artifact '$ARTIFACT_NAME' not found in run $PREVIOUS_RUN_ID."
+             echo "artifact_found=false" >> $GITHUB_OUTPUT
+             exit 0
+          fi
+
+          DOWNLOAD_URL=$(echo "$ARTIFACT_INFO_JSON" | jq -r '.archive_download_url')
+          ARTIFACT_ID=$(echo "$ARTIFACT_INFO_JSON" | jq -r '.id')
+          echo "Found artifact ID: $ARTIFACT_ID. Download URL acquired."
+          # --- End Find Artifact Info ---
+
+          # --- Download Artifact ---
+          echo "Downloading artifact..."
+          mkdir -p ./state_temp ./state
+          curl --fail -L -o ./state_temp/artifact.zip "$DOWNLOAD_URL" -H "Authorization: Bearer $GH_TOKEN"
+          CURL_EXIT_CODE=$?
+          if [ $CURL_EXIT_CODE -ne 0 ]; then
+             echo "Error: curl command failed with exit code $CURL_EXIT_CODE"
+             echo "artifact_found=false" >> $GITHUB_OUTPUT
+             exit 0
+          fi
+          # --- End Download Artifact ---
+
+          # --- Unzip and Verify ---
+          echo "Unzipping artifact..."
+          if ! unzip -tq ./state_temp/artifact.zip; then
+             echo "Error: Downloaded file artifact.zip is not a valid zip file."
+             echo "artifact_found=false" >> $GITHUB_OUTPUT
+             exit 0
+          fi
+          echo "Listing contents of artifact.zip before extraction:"
+          unzip -l ./state_temp/artifact.zip
+          unzip -o ./state_temp/artifact.zip -d ./state
+          UNZIP_EXIT_CODE=$?
+           if [ $UNZIP_EXIT_CODE -ne 0 ]; then
+             echo "Error: unzip command failed with exit code $UNZIP_EXIT_CODE"
+             echo "artifact_found=false" >> $GITHUB_OUTPUT
+             exit 0
+          fi
+          echo "Listing contents of ./state directory after extraction:"
+          ls -l ./state
+          if [ -f ./state/timestamp.txt ]; then
+             echo "Artifact successfully downloaded and unzipped to ./state/timestamp.txt"
+             echo "artifact_found=true" >> $GITHUB_OUTPUT
+          else
+             echo "Error: timestamp.txt not found after unzipping at ./state/timestamp.txt."
+             echo "artifact_found=false" >> $GITHUB_OUTPUT
+             # exit 1 # Ensure this is commented out
+          fi
+          # --- End Unzip and Verify ---
+        
+      - name: Read last processed timestamp
+        id: read_state
+        run: |
+          if [ -f ./state/timestamp.txt ]; then
+            timestamp=$(cat ./state/timestamp.txt)
+            # Validate timestamp format (ISO 8601 UTC)
+            if [[ "$timestamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+              echo "last_timestamp=$timestamp" >> $GITHUB_OUTPUT
+            else
+              echo "last_timestamp=1970-01-01T00:00:00Z" >> $GITHUB_OUTPUT
+              echo "Warning: Invalid timestamp found in artifact ('$timestamp'), using default."
+            fi
+          else
+            # Default to a very old timestamp if no artifact exists
+            echo "last_timestamp=1970-01-01T00:00:00Z" >> $GITHUB_OUTPUT
+            echo "No previous state found."
+          fi
+          echo "Last processed timestamp: $(cat $GITHUB_OUTPUT | grep last_timestamp | cut -d'=' -f2)"
+
+
+      # --- Check via GraphQL (Replaces the REST API check) ---
+      - name: Check nocobase/nocobase via GraphQL for new commit
+        id: check_commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAST_TIMESTAMP: ${{ steps.read_state.outputs.last_timestamp }}
+          CHECK_USER_LOGIN: ${{ github.repository_owner }} # User whose commits we're looking for
+          TARGET_REPO_FULLNAME: "nocobase/nocobase"       # Target repo Owner/Name
+        run: |
+          REPO_OWNER=$(echo $TARGET_REPO_FULLNAME | cut -d'/' -f1)
+          REPO_NAME=$(echo $TARGET_REPO_FULLNAME | cut -d'/' -f2)
+
+          echo "Checking repository ${TARGET_REPO_FULLNAME} for new commits..."
+          echo "Looking for commits authored by: ${CHECK_USER_LOGIN}"
+          echo "Filtering commits authored after: ${LAST_TIMESTAMP}"
+
+          # Define the corrected GraphQL query:
+          # - Fetch the first 30 refs (branches) based on default ordering.
+          # - Removed orderBy clause.
+          # - Removed $sinceDate variable declaration.
+          # Increase 'first: 30' to e.g., 'first: 50' or 'first: 100' if concerned about missing
+          # commits on less frequently returned branches.
+          GRAPHQL_QUERY=$(cat <<EOF
+          query RecentCommitsByAuthor(\$repoOwner: String!, \$repoName: String!) {
+            repository(owner: \$repoOwner, name: \$repoName) {
+              refs(refPrefix: "refs/heads/", first: 100) {
+                nodes {
+                  name # Branch name
+                  target {
+                    ... on Commit {
+                      oid # Commit SHA
+                      authoredDate
+                      author {
+                        user {
+                          login
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          EOF
+          )
+
+          # Initialize variables
+          LATEST_MATCH_TIMESTAMP="1970-01-01T00:00:00Z"
+          LATEST_MATCH_BRANCH=""
+          LATEST_MATCH_SHA=""
+          TRIGGER="false"
+
+          # Execute GraphQL query using GitHub CLI and process with jq
+          echo "Running GraphQL query..."
+          # Removed the -f sinceDate=... argument
+          RESULT_JSON=$(gh api graphql -f query="$GRAPHQL_QUERY" \
+            -f repoOwner="$REPO_OWNER" -f repoName="$REPO_NAME" \
+             --jq '.' || echo "null") # Handle potential API errors by outputting "null"
+
+          # --- DEBUG STEP: Print the raw JSON result ---
+          echo "--- RAW GRAPHQL RESULT ---"
+          echo "$RESULT_JSON"
+          echo "--- END RAW GRAPHQL RESULT ---"
+          # --- END DEBUG STEP ---
+
+          if [ -z "$RESULT_JSON" ] || [ "$RESULT_JSON" == "null" ]; then
+             echo "Error: GraphQL query failed or returned empty."
+          elif [ "$(echo "$RESULT_JSON" | jq '.errors')" != "null" ]; then
+             echo "Error: GraphQL query returned errors:"
+             echo "$RESULT_JSON" | jq '.errors'
+          elif [ "$(echo "$RESULT_JSON" | jq -r '.data.repository.refs.nodes // [] | length')" -gt 0 ]; then # Added // [] for safety
+            echo "Processing results..."
+            # Use jq to iterate through the commits on branch heads, filter by author and date,
+            # find the one with the most recent authoredDate.
+            # The jq logic remains the same, using the LAST_TIMESTAMP env var via --arg lastTs
+            LATEST_MATCH=$(echo "$RESULT_JSON" | jq -r \
+              --arg checkUser "$CHECK_USER_LOGIN" \
+              --arg lastTs "$LAST_TIMESTAMP" \
+              '
+              .data.repository.refs.nodes
+              | map(select(
+                  .target? != null and
+                  .target.author?.user?.login? == $checkUser and
+                  .target.authoredDate? > $lastTs
+              ))
+              | sort_by(.target.authoredDate) # Sort ascending by date
+              | last # Get the latest one
+              | select(. != null) # Ensure we found something
+              // empty # Return empty string if no match
+              ')
+
+
+            if [ -n "$LATEST_MATCH" ] && [ "$LATEST_MATCH" != "null" ]; then
+              LATEST_MATCH_BRANCH=$(echo "$LATEST_MATCH" | jq -r '.name')
+              LATEST_MATCH_SHA=$(echo "$LATEST_MATCH" | jq -r '.target.oid')
+              LATEST_MATCH_TIMESTAMP=$(echo "$LATEST_MATCH" | jq -r '.target.authoredDate')
+              # Final check to ensure this "latest" is truly newer than the stored state
+              if [[ "$LATEST_MATCH_TIMESTAMP" > "$LAST_TIMESTAMP" ]]; then
+                 TRIGGER="true"
+                 echo "Found latest matching commit by $CHECK_USER_LOGIN on branch '$LATEST_MATCH_BRANCH' (SHA: $LATEST_MATCH_SHA) authored at $LATEST_MATCH_TIMESTAMP"
+              else
+                 # This case should be less likely now due to the > $lastTs filter in jq, but kept for safety
+                 echo "Found commit $LATEST_MATCH_SHA by $CHECK_USER_LOGIN but its timestamp ($LATEST_MATCH_TIMESTAMP) is not newer than the last processed timestamp ($LAST_TIMESTAMP). Ignoring."
+              fi
+            else
+              echo "No new commits found authored by $CHECK_USER_LOGIN in the checked refs since $LAST_TIMESTAMP."
+            fi
+          else
+             echo "GraphQL query returned successfully but found no refs or relevant commit data."
+          fi
+
+          # Set outputs for the next job
+          echo "triggered=${TRIGGER}" >> $GITHUB_OUTPUT
+          echo "branch=${LATEST_MATCH_BRANCH}" >> $GITHUB_OUTPUT
+          echo "sha=${LATEST_MATCH_SHA}" >> $GITHUB_OUTPUT
+          # Only output timestamp if triggered to avoid saving old/invalid timestamp
+          if [ "$TRIGGER" == "true" ]; then
+             echo "timestamp=${LATEST_MATCH_TIMESTAMP}" >> $GITHUB_OUTPUT
+          fi
+
+      # --- State Saving (Update Artifact Name) ---
+      # Save the authoredDate of the *newly found commit* as an artifact
+      - name: Save latest processed commit timestamp as artifact
+        # Only run this step if a new commit was actually found and triggered the process
+        if: steps.check_commit.outputs.triggered == 'true'
+        run: |
+          mkdir -p ./state
+          echo "${{ steps.check_commit.outputs.timestamp }}" > ./state/timestamp.txt
+          echo "Saving timestamp for next run: ${{ steps.check_commit.outputs.timestamp }}"
+      - uses: actions/upload-artifact@v4
+        if: steps.check_commit.outputs.triggered == 'true'
+        with:
+          name: last-repo-b-owner-commit-timestamp # Must match the download name
+          path: ./state/timestamp.txt
+          retention-days: 90 # Keep state artifacts for a reasonable time
+
+      # --- Trigger the E2E Test Workflow ---
+      - name: Trigger E2E Test Workflow
+        if: steps.check_commit.outputs.triggered == 'true' # Only run if a new commit was found
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Use secrets.GITHUB_TOKEN for gh cli auth
+          COMMIT_SHA: ${{ steps.check_commit.outputs.sha }}
+          BRANCH_NAME: ${{ steps.check_commit.outputs.branch }}
+        run: |
+          echo "Triggering E2E test workflow (e2e-tests.yml) for commit $COMMIT_SHA on branch $BRANCH_NAME..."
+          gh workflow run e2e-tests.yml \
+            -R ${{ github.repository }} \
+            -f commit_sha="$COMMIT_SHA" \
+            -f branch_name="$BRANCH_NAME"
+          echo "Workflow trigger command sent."
