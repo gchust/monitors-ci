@@ -121,6 +121,12 @@ jobs:
             -f repoOwner="$REPO_OWNER" -f repoName="$REPO_NAME" \
              --jq '.' || echo "null") # Handle potential API errors by outputting "null"
 
+          # --- DEBUG STEP: Print the raw JSON result ---
+          echo "--- RAW GRAPHQL RESULT ---"
+          echo "$RESULT_JSON"
+          echo "--- END RAW GRAPHQL RESULT ---"
+          # --- END DEBUG STEP ---
+
           if [ -z "$RESULT_JSON" ] || [ "$RESULT_JSON" == "null" ]; then
              echo "Error: GraphQL query failed or returned empty."
           elif [ "$(echo "$RESULT_JSON" | jq '.errors')" != "null" ]; then
