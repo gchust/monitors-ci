@@ -1,0 +1,112 @@
+# .github/workflows/e2e-tests.yml
+name: Run Nocobase E2E Tests (Triggerable)
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'The commit SHA to checkout and test'
+        required: true
+      branch_name:
+        description: 'The branch name (for context/artifact naming)'
+        required: false
+        default: 'unknown-branch'
+
+# Set permissions: only needs to read contents to checkout code
+permissions:
+  contents: read
+  actions: read # Needed by actions/upload-artifact
+
+# Concurrency specifically for E2E test runs
+# Ensures only one E2E test run is active at a time for the main target
+# You could make the group more specific if needed, e.g., per branch using inputs
+concurrency:
+  group: e2e-tests-${{ github.repository }} # Group all E2E runs for this repo together
+  cancel-in-progress: true
+
+jobs:
+  run_e2e_tests:
+    name: Run Nocobase E2E Tests on ${{ github.event.inputs.commit_sha }}
+    runs-on: ubuntu-latest
+    container: node:18
+    services:
+      postgres:
+        image: postgres:11
+        env:
+          POSTGRES_USER: nocobase
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      # Checkout the specific commit from nocobase/nocobase passed via input
+      - name: Checkout nocobase/nocobase code on specific commit
+        uses: actions/checkout@v4
+        with:
+          repository: nocobase/nocobase # Target repository
+          ref: ${{ github.event.inputs.commit_sha }} # Use the SHA from the input
+
+      # Setup Node.js environment
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'yarn' # Enable yarn caching based on lockfile
+
+      # Get yarn cache directory path (needed for caching step)
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT # Use GITHUB_OUTPUT
+
+      # Setup caching for yarn dependencies
+      - name: Cache yarn dependencies
+        uses: actions/cache@v4
+        id: yarn-cache # Optional: Cache step ID
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      # Install project dependencies
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      # Build packages as required by E2E tests
+      - name: Build packages
+        run: yarn build
+        env:
+          __E2E__: true # Set environment variable needed during build for E2E
+
+      # Install Playwright browsers required for tests
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+
+      # Execute the E2E tests
+      - name: Run E2E tests (Core and Plugins - adapted)
+        run: yarn e2e p-test --ignore 'packages/**/{plugin-data-source-main,plugin-workflow,plugin-workflow-*}/**/__e2e__/**/*.test.ts'
+        env:
+          # Set environment variables required by the tests
+          __E2E__: true
+          APP_ENV: production
+          LOGGER_LEVEL: error
+          DB_DIALECT: postgres
+          DB_HOST: postgres # Use the service name defined above
+          DB_PORT: 5432
+          DB_USER: nocobase
+          DB_PASSWORD: password
+          DB_DATABASE: nocobase
+          ENCRYPTION_FIELD_KEY: 1%&glK;<UA}aIxJVc53-4G(rTi0vg@J] # Use a placeholder or manage securely if needed for tests
+
+      # Optional: Upload E2E test reports as artifacts for review
+      - name: Upload E2E test report artifact
+        # Run this step even if the previous test step failed, to capture failure reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report-${{ github.event.inputs.branch_name }}-${{ github.event.inputs.commit_sha }}-${{ github.run_id }}
+          path: ./storage/playwright/tests-report-blob/blob-*/* # Path to Playwright reports in nocobase structure
+          retention-days: 7 # Keep reports for 7 days
