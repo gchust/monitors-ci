@@ -37,7 +37,7 @@ jobs:
       - name: Manually List Artifacts via API
         env:
           GH_TOKEN: ${{ github.token }}
-          PREVIOUS_RUN_ID: 2873127429 # The run ID that should have the artifact
+          PREVIOUS_RUN_ID: 14237362210 # The run ID that should have the artifact
         run: |
           echo "Attempting to list artifacts for Run ID ${PREVIOUS_RUN_ID} via REST API:"
           gh api "/repos/${{ github.repository }}/actions/runs/${PREVIOUS_RUN_ID}/artifacts" -q '.artifacts[] | select(.name=="last-repo-b-owner-commit-timestamp")' || echo "API call failed or artifact not found for run ${PREVIOUS_RUN_ID}"
