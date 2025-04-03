@@ -78,14 +78,16 @@ jobs:
           echo "Looking for commits authored by: ${CHECK_USER_LOGIN}"
           echo "Filtering commits authored after: ${LAST_TIMESTAMP}"
 
-          # Define the GraphQL query:
-          # - Fetch the 30 most recently pushed-to branches (refs/heads/)
-          # - For each branch, get the HEAD commit's oid, authoredDate, and author login.
-          # - We will filter client-side using jq. Increase 'first: 30' if needed.
+          # Define the corrected GraphQL query:
+          # - Fetch the first 30 refs (branches) based on default ordering.
+          # - Removed orderBy clause.
+          # - Removed $sinceDate variable declaration.
+          # Increase 'first: 30' to e.g., 'first: 50' or 'first: 100' if concerned about missing
+          # commits on less frequently returned branches.
           GRAPHQL_QUERY=$(cat <<EOF
-          query RecentCommitsByAuthor(\$repoOwner: String!, \$repoName: String!, \$sinceDate: GitTimestamp!) {
+          query RecentCommitsByAuthor(\$repoOwner: String!, \$repoName: String!) {
             repository(owner: \$repoOwner, name: \$repoName) {
-              refs(refPrefix: "refs/heads/", first: 30, orderBy: {field: TARGET, direction: DESC}) {
+              refs(refPrefix: "refs/heads/", first: 30) {
                 nodes {
                   name # Branch name
                   target {
@@ -114,19 +116,21 @@ jobs:
 
           # Execute GraphQL query using GitHub CLI and process with jq
           echo "Running GraphQL query..."
+          # Removed the -f sinceDate=... argument
           RESULT_JSON=$(gh api graphql -f query="$GRAPHQL_QUERY" \
             -f repoOwner="$REPO_OWNER" -f repoName="$REPO_NAME" \
-            -f sinceDate="$LAST_TIMESTAMP" --jq '.' || echo "null") # Handle potential API errors by outputting "null"
+             --jq '.' || echo "null") # Handle potential API errors by outputting "null"
 
           if [ -z "$RESULT_JSON" ] || [ "$RESULT_JSON" == "null" ]; then
              echo "Error: GraphQL query failed or returned empty."
           elif [ "$(echo "$RESULT_JSON" | jq '.errors')" != "null" ]; then
              echo "Error: GraphQL query returned errors:"
              echo "$RESULT_JSON" | jq '.errors'
-          elif [ "$(echo "$RESULT_JSON" | jq -r '.data.repository.refs.nodes | length')" -gt 0 ]; then
+          elif [ "$(echo "$RESULT_JSON" | jq -r '.data.repository.refs.nodes // [] | length')" -gt 0 ]; then # Added // [] for safety
             echo "Processing results..."
             # Use jq to iterate through the commits on branch heads, filter by author and date,
             # find the one with the most recent authoredDate.
+            # The jq logic remains the same, using the LAST_TIMESTAMP env var via --arg lastTs
             LATEST_MATCH=$(echo "$RESULT_JSON" | jq -r \
               --arg checkUser "$CHECK_USER_LOGIN" \
               --arg lastTs "$LAST_TIMESTAMP" \
@@ -153,6 +157,7 @@ jobs:
                  TRIGGER="true"
                  echo "Found latest matching commit by $CHECK_USER_LOGIN on branch '$LATEST_MATCH_BRANCH' (SHA: $LATEST_MATCH_SHA) authored at $LATEST_MATCH_TIMESTAMP"
               else
+                 # This case should be less likely now due to the > $lastTs filter in jq, but kept for safety
                  echo "Found commit $LATEST_MATCH_SHA by $CHECK_USER_LOGIN but its timestamp ($LATEST_MATCH_TIMESTAMP) is not newer than the last processed timestamp ($LAST_TIMESTAMP). Ignoring."
               fi
             else
