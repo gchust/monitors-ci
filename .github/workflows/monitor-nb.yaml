@@ -34,100 +34,56 @@ jobs:
         uses: actions/checkout@v4
 
       # --- State Management (Same as before) ---
-      - name: Manually Find and Download Artifact (Debug v3)
+      - name: Manually Find and Download Artifact (Debug v4)
         id: manual_download
         env:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_NAME: "last-repo-b-owner-commit-timestamp"
         run: |
-          # --- Debugging WORKFLOW_ID ---
-          echo "Listing available workflows (for debugging):"
-          gh workflow list --limit 5 --json name,id,path || echo "Warning: Failed to list workflows."
-
+          # --- Script to find WORKFLOW_ID (using corrected logic) ---
           WORKFLOW_NAME_FROM_CONTEXT="${{ github.workflow }}"
-          echo "Finding workflow ID for workflow named: '${WORKFLOW_NAME_FROM_CONTEXT}'"
-
-          # Try using gh workflow view first, capture output and exit code explicitly
-          echo "Attempting: gh workflow view \"${WORKFLOW_NAME_FROM_CONTEXT}\" --json id,name,path"
-          VIEW_OUTPUT=$(gh workflow view "${WORKFLOW_NAME_FROM_CONTEXT}" --json id,name,path)
-          VIEW_EXIT_CODE=$?
-          echo "gh workflow view exited with code: $VIEW_EXIT_CODE"
-          echo "gh workflow view raw output: $VIEW_OUTPUT"
-
-          WORKFLOW_ID="" # Initialize WORKFLOW_ID
-
-          # Check if view command succeeded and output is not empty/null
-          if [ $VIEW_EXIT_CODE -eq 0 ] && [ -n "$VIEW_OUTPUT" ] && [ "$VIEW_OUTPUT" != "null" ]; then
-              # Try extracting ID using jq. Use -e to set exit code if path not found.
-              WORKFLOW_ID=$(echo "$VIEW_OUTPUT" | jq -e -r '.id // empty')
-              JQ_EXIT_CODE=$?
-              if [ $JQ_EXIT_CODE -ne 0 ] || [ -z "$WORKFLOW_ID" ]; then
-                 echo "jq failed to extract .id from gh workflow view output (Exit code: $JQ_EXIT_CODE)."
-                 WORKFLOW_ID="" # Ensure it's empty on jq failure
-              else
-                 echo "Extracted WORKFLOW_ID using gh workflow view: $WORKFLOW_ID"
-              fi
-          else
-            echo "gh workflow view command failed or returned empty output."
-          fi
-
-          # Fallback using API list if view command failed or ID extraction failed
+          echo "Finding workflow ID for workflow named: '${WORKFLOW_NAME_FROM_CONTEXT}' via API..."
+          WORKFLOW_ID=$(gh api "/repos/${{ github.repository }}/actions/workflows" --paginate -q \
+            --arg workflow_name "${WORKFLOW_NAME_FROM_CONTEXT}" \
+            '.workflows[] | select(.name == $workflow_name) | .id // empty' | head -n 1)
           if [ -z "$WORKFLOW_ID" ]; then
-            echo "Fallback: Listing workflows via API to find ID for name..."
-            WORKFLOW_ID=$(gh api "/repos/${{ github.repository }}/actions/workflows" --paginate -q \
-              --arg workflow_name "${WORKFLOW_NAME_FROM_CONTEXT}" \
-              '.workflows[] | select(.name == $workflow_name) | .id // empty' | head -n 1)
-
-             if [ -z "$WORKFLOW_ID" ]; then
-                echo "Fallback using API also failed."
-             else
-                echo "Fallback using API succeeded. Workflow ID: $WORKFLOW_ID"
-             fi
-          fi
-
-          # Final check if WORKFLOW_ID is determined
-          if [ -z "$WORKFLOW_ID" ]; then
-             echo "Error: Could not determine workflow ID using name '${WORKFLOW_NAME_FROM_CONTEXT}' after all attempts."
+             echo "Error: Could not determine workflow ID using name '${WORKFLOW_NAME_FROM_CONTEXT}' via API."
              exit 1
           fi
           echo "Successfully determined Workflow ID: $WORKFLOW_ID"
-          # --- END OF WORKFLOW ID CORRECTION ---
+          # --- End WORKFLOW_ID ---
 
-          # --- Rest of the script (Find Previous Run, Download, Unzip) ---
-          # Get the ID of the most recent completed run *before* the current one
+          # --- Find Previous Run ID ---
           echo "Fetching recent runs for workflow ID $WORKFLOW_ID..."
           PREVIOUS_RUN_ID=$(gh api "/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs" --paginate -q \
             --argjson current_run_id ${{ github.run_id }} \
             '.workflow_runs | map(select(.id != $current_run_id and (.status == "completed"))) | sort_by(.created_at) | reverse | .[0].id // empty')
-
           if [ -z "$PREVIOUS_RUN_ID" ]; then
             echo "Could not find a previous completed run."
             echo "artifact_found=false" >> $GITHUB_OUTPUT
             exit 0
           fi
-
           echo "Found previous completed run ID: $PREVIOUS_RUN_ID"
+          # --- End Find Previous Run ID ---
+
+          # --- Find Artifact Info ---
           echo "Attempting to find artifact '$ARTIFACT_NAME' in run $PREVIOUS_RUN_ID via REST API:"
           ARTIFACT_INFO_JSON=$(gh api "/repos/${{ github.repository }}/actions/runs/${PREVIOUS_RUN_ID}/artifacts" -q \
             --arg artifact_name "$ARTIFACT_NAME" \
             '.artifacts[] | select(.name==$artifact_name)' || echo "null")
-
-          if [ "$ARTIFACT_INFO_JSON" == "null" ]; then
-            echo "Error: API call to list artifacts failed for run $PREVIOUS_RUN_ID."
-            echo "artifact_found=false" >> $GITHUB_OUTPUT
-            exit 0
-          elif [ -z "$ARTIFACT_INFO_JSON" ] || [ "$ARTIFACT_INFO_JSON" == "[]" ]; then
-            echo "Artifact '$ARTIFACT_NAME' not found in run $PREVIOUS_RUN_ID."
-            echo "artifact_found=false" >> $GITHUB_OUTPUT
-            exit 0
+          if [ "$ARTIFACT_INFO_JSON" == "null" ] || [ -z "$ARTIFACT_INFO_JSON" ] || [ "$ARTIFACT_INFO_JSON" == "[]" ]; then
+             echo "Artifact '$ARTIFACT_NAME' not found in run $PREVIOUS_RUN_ID (or API failed)."
+             echo "artifact_found=false" >> $GITHUB_OUTPUT
+             exit 0
           fi
-
           DOWNLOAD_URL=$(echo "$ARTIFACT_INFO_JSON" | jq -r '.archive_download_url')
           ARTIFACT_ID=$(echo "$ARTIFACT_INFO_JSON" | jq -r '.id')
           echo "Found artifact ID: $ARTIFACT_ID. Download URL acquired."
+          # --- End Find Artifact Info ---
 
+          # --- Download Artifact ---
           echo "Downloading artifact..."
-          mkdir -p ./state_temp
+          mkdir -p ./state_temp ./state
           curl --fail -L -o ./state_temp/artifact.zip "$DOWNLOAD_URL" -H "Authorization: Bearer $GH_TOKEN"
           CURL_EXIT_CODE=$?
           if [ $CURL_EXIT_CODE -ne 0 ]; then
@@ -135,23 +91,48 @@ jobs:
              echo "artifact_found=false" >> $GITHUB_OUTPUT
              exit 0
           fi
+          # --- End Download Artifact ---
 
+          # --- Unzip and Verify ---
           echo "Unzipping artifact..."
+          # Check zip validity
           if ! unzip -tq ./state_temp/artifact.zip; then
              echo "Error: Downloaded file artifact.zip is not a valid zip file."
              echo "artifact_found=false" >> $GITHUB_OUTPUT
              exit 0
           fi
-          unzip -o ./state_temp/artifact.zip -d ./state
 
+          # --- DEBUG: List zip contents ---
+          echo "Listing contents of artifact.zip before extraction:"
+          unzip -l ./state_temp/artifact.zip
+          # --- End Debug ---
+
+          # Unzip, overwriting existing files, into ./state directory
+          unzip -o ./state_temp/artifact.zip -d ./state
+          UNZIP_EXIT_CODE=$?
+          if [ $UNZIP_EXIT_CODE -ne 0 ]; then
+             echo "Error: unzip command failed with exit code $UNZIP_EXIT_CODE"
+             echo "artifact_found=false" >> $GITHUB_OUTPUT
+             exit 0 # Treat unzip failure as state not found
+          fi
+
+          # --- DEBUG: List extracted files ---
+          echo "Listing contents of ./state directory after extraction:"
+          ls -l ./state
+          # --- End Debug ---
+
+          # Verify timestamp file exists after unzip
           if [ -f ./state/timestamp.txt ]; then
              echo "Artifact successfully downloaded and unzipped to ./state/timestamp.txt"
              echo "artifact_found=true" >> $GITHUB_OUTPUT
           else
-             echo "Error: timestamp.txt not found after unzipping."
+             echo "Error: timestamp.txt not found after unzipping at ./state/timestamp.txt."
              echo "artifact_found=false" >> $GITHUB_OUTPUT
+             # Make sure this line IS commented out for now, unless you WANT the step to fail here
+             # exit 1
           fi
-          
+          # --- End Unzip and Verify ---
+            
       - name: Read last processed timestamp
         id: read_state
         run: |
