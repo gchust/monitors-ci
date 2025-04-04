@@ -40,7 +40,7 @@ jobs:
         with:
           # 确保这个 name 与 upload-artifact 步骤中的 name 完全一致
           name: last-repo-b-owner-commit-timestamp
-          path: ./state
+          path: ./state/timestamp.txt
           run-id: ''
         # 保持 continue-on-error: true 以处理首次运行或 artifact 找不到的情况
         continue-on-error: true
