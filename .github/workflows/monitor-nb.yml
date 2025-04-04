@@ -268,14 +268,11 @@ jobs:
       # --- State Saving (Update Artifact Name) ---
       # Save the authoredDate of the *newly found commit* as an artifact
       - name: Save latest processed commit timestamp as artifact
-        # Only run this step if a new commit was actually found and triggered the process
-        if: steps.check_commit.outputs.triggered == 'true'
         run: |
           mkdir -p ./state
           echo "${{ steps.check_commit.outputs.timestamp }}" > ./state/timestamp.txt
           echo "Saving timestamp for next run: ${{ steps.check_commit.outputs.timestamp }}"
       - uses: actions/upload-artifact@v4
-        if: steps.check_commit.outputs.triggered == 'true'
         with:
           name: last-repo-b-owner-commit-timestamp # Must match the download name
           path: ./state/timestamp.txt
