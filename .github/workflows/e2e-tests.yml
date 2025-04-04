@@ -313,3 +313,130 @@ jobs:
           # Adjust path based on where the merge command outputs the report
           path: ./e2e-html-report/index.html # Default path from original workflow
           retention-days: 14
+
+  report-and-comment:
+    name: Report E2E Result to Issue & Upload Artifact
+    needs: [build, test-core, test-data-source-main] # Depends on all preceding jobs
+    runs-on: ubuntu-latest
+    if: always() # Run even if upstream jobs fail
+    steps:
+      # --- Part 1: Artifact Handling (Optional, keep if needed) ---
+      - name: Download all E2E report artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: e2e-report # Download all artifacts matching the pattern into this folder
+          pattern: e2e-report-* # Match artifacts from both test jobs
+          merge-multiple: true # Merge artifacts with the same name pattern
+
+      # If you have report merging script & config in this repo, uncomment these:
+      # - name: Checkout current repo code (for merge script)
+      #   uses: actions/checkout@v4
+      # - name: Use Node.js 18 (for merge script)
+      #   uses: actions/setup-node@v4
+      #   with:
+      #     node-version: 18
+      #     cache: 'yarn'
+      # - name: Install dependencies (for merge script)
+      #   run: yarn install --frozen-lockfile
+      # - name: Merge reports
+      #   run: |
+      #     node scripts/moveE2EReportFiles.js && npx playwright merge-reports --config .github/workflows/merge.config.ts ./e2e-report
+      #   env:
+      #     NODE_OPTIONS: --max-old-space-size=4096
+      # - name: Upload final E2E HTML report (Optional)
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: final-e2e-html-report-${{ github.event.inputs.branch_name }}-${{ github.event.inputs.commit_sha }}
+      #     path: ./e2e-html-report/index.html # Adjust path if needed
+      #     retention-days: 14
+
+      # --- Part 2: Issue Commenting ---
+      - name: Find or Create Issue and Post Comment
+        uses: actions/github-script@v7
+        env:
+          BRANCH_NAME: "${{ github.event.inputs.branch_name }}"
+          COMMIT_SHA: "${{ github.event.inputs.commit_sha }}"
+          # Determine overall status: success only if all 'needs' succeeded
+          OVERALL_STATUS: ${{ (needs.build.result == 'success' && needs.test-core.result == 'success' && needs.test-data-source-main.result == 'success') && 'Success ✅' || 'Failure ❌' }}
+          CORE_STATUS: "${{ needs.test-core.result }}"
+          DS_MAIN_STATUS: "${{ needs.test-data-source-main.result }}"
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TARGET_OWNER: "${{ vars.ISSUE_COMMENT_TARGET_OWNER }}" # Use variable
+          TARGET_REPO: "${{ vars.ISSUE_COMMENT_TARGET_REPO }}"  # Use variable
+        with:
+          github-token: ${{ secrets.ISSUES_REPO_PAT }} # Use the PAT secret
+          script: |
+            const { BRANCH_NAME, COMMIT_SHA, OVERALL_STATUS, CORE_STATUS, DS_MAIN_STATUS, RUN_URL, TARGET_OWNER, TARGET_REPO } = process.env;
+            const issueTitle = BRANCH_NAME || 'unknown-branch'; // Use default if empty
+
+            // Check if target owner/repo vars are set
+            if (!TARGET_OWNER || !TARGET_REPO) {
+              core.warning('ISSUE_COMMENT_TARGET_OWNER or ISSUE_COMMENT_TARGET_REPO variable is not set. Skipping issue comment.');
+              return;
+            }
+
+            // 1. Find issue
+            core.info(`Searching for issue with title: "${issueTitle}" in ${TARGET_OWNER}/${TARGET_REPO}`);
+            let issue_number = null;
+            try {
+              const { data: issues } = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${TARGET_OWNER}/${TARGET_REPO} is:issue is:open in:title "${issueTitle}"`,
+                per_page: 1
+              });
+              if (issues.total_count > 0) {
+                issue_number = issues.items[0].number;
+                core.info(`Found existing issue number: ${issue_number}`);
+              } else {
+                core.info('No existing issue found.');
+              }
+            } catch (error) {
+              core.error(`Error searching for issue: ${error.message}`);
+              if (error.status !== 404) {
+                 core.warning(`Proceeding to create issue despite search error.`);
+              } else {
+                 core.setFailed(`Cannot access or find repo ${TARGET_OWNER}/${TARGET_REPO}. Check PAT permissions and repo variables.`);
+                 return; // Stop execution
+              }
+            }
+
+            // 2. Create issue if not found
+            if (!issue_number) {
+              core.info(`Creating new issue with title: "${issueTitle}"`);
+              try {
+                const { data: newIssue } = await github.rest.issues.create({
+                  owner: TARGET_OWNER,
+                  repo: TARGET_REPO,
+                  title: issueTitle,
+                  body: `Tracking test results for branch: ${issueTitle}\nLatest Commit: ${COMMIT_SHA}`
+                });
+                issue_number = newIssue.number;
+                core.info(`Created new issue number: ${issue_number}`);
+              } catch (error) {
+                core.setFailed(`Failed to create issue: ${error.message}. Check PAT permissions.`);
+                return; // Stop execution
+              }
+            }
+
+            // 3. Format and Post Comment
+            const commentBody = `
+            **E2E Test Results** for commit \`${COMMIT_SHA.substring(0, 7)}\` on branch \`${issueTitle}\`
+
+            * **Overall Status:** ${OVERALL_STATUS}
+            * Core Tests: \`${CORE_STATUS}\`
+            * Data Source Main Tests: \`${DS_MAIN_STATUS}\`
+
+            [Link to Workflow Run](${RUN_URL})
+            `;
+
+            core.info(`Posting comment to issue ${issue_number}`);
+            try {
+              await github.rest.issues.createComment({
+                owner: TARGET_OWNER,
+                repo: TARGET_REPO,
+                issue_number: issue_number,
+                body: commentBody
+              });
+              core.info('Successfully posted comment.');
+            } catch (error) {
+              core.setFailed(`Failed to post comment: ${error.message}.`);
+            }
