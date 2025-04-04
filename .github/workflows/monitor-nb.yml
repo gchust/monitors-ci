@@ -34,57 +34,63 @@ jobs:
       - name: Checkout current repo code
         uses: actions/checkout@v4
 
-      - name: Download State Artifact via API
-        id: download_state_via_api # 给这个步骤一个 ID
+      - name: Download State Artifact via API (v9 - Final Corrected)
+        id: download_state_via_api
         env:
           GH_TOKEN: ${{ github.token }}
-          ARTIFACT_NAME: "last-repo-b-owner-commit-timestamp" # 确认与上传步骤的名称一致
+          ARTIFACT_NAME: "last-repo-b-owner-commit-timestamp"
         run: |
-          set -e # 遇到错误立即退出
+          set -e # Ensure script exits immediately on errors
 
           # --- 1. 获取 Workflow ID ---
           WORKFLOW_NAME_FROM_CONTEXT="${{ github.workflow }}"
           REPO_NAME="${{ github.repository }}"
           API_URL_WF="/repos/${REPO_NAME}/actions/workflows"
           echo "Finding workflow ID for '${WORKFLOW_NAME_FROM_CONTEXT}'..."
-          WF_API_OUTPUT=$(gh api "${API_URL_WF}" --paginate -q)
+          # Step 1: Run gh api, save output. NO -q HERE.
+          WF_API_OUTPUT=$(gh api "${API_URL_WF}" --paginate)
           WF_API_EXIT_CODE=$?
           if [ $WF_API_EXIT_CODE -ne 0 ]; then echo "Error: Failed list workflows (Code: $WF_API_EXIT_CODE)."; gh api "${API_URL_WF}" --paginate || true; exit 1; fi
+
+          # Step 2: Run jq on the saved output
           WORKFLOW_ID=$(echo "${WF_API_OUTPUT}" | jq -r --arg workflow_name "${WORKFLOW_NAME_FROM_CONTEXT}" '.workflows[] | select(.name == $workflow_name) | .id // empty' | head -n 1)
           if [ -z "$WORKFLOW_ID" ]; then echo "Error: Could not determine workflow ID for name '${WORKFLOW_NAME_FROM_CONTEXT}'."; exit 1; fi
-          echo "Using Workflow ID: $WORKFLOW_ID"
+          echo "Successfully determined Workflow ID: $WORKFLOW_ID"
 
           # --- 2. 查找上一次已完成的运行 ID ---
           echo "Fetching recent runs for workflow ID $WORKFLOW_ID..."
           RUNS_API_URL="/repos/${REPO_NAME}/actions/workflows/${WORKFLOW_ID}/runs"
           CURRENT_RUN_ID=${{ github.run_id }}
-          RUNS_API_OUTPUT=$(gh api "${RUNS_API_URL}" --paginate -q)
+          # Step 1: Run gh api, save output. NO -q HERE.
+          RUNS_API_OUTPUT=$(gh api "${RUNS_API_URL}" --paginate)
           RUNS_API_EXIT_CODE=$?
           if [ $RUNS_API_EXIT_CODE -ne 0 ]; then echo "Error: Failed list runs (Code: $RUNS_API_EXIT_CODE)."; gh api "${RUNS_API_URL}" --paginate || true; exit 1; fi
+
+          # Step 2: Run jq on the saved output
           PREVIOUS_RUN_ID=$(echo "${RUNS_API_OUTPUT}" | jq -r --argjson current_run_id ${CURRENT_RUN_ID} \
             '.workflow_runs | map(select(.id != $current_run_id and (.status == "completed"))) | sort_by(.created_at) | reverse | .[0].id // empty')
           if [ -z "$PREVIOUS_RUN_ID" ] || [ "$PREVIOUS_RUN_ID" == "null" ]; then
             echo "No previous completed run found. Proceeding with default timestamp."
-            # 不需要设置 output，后续步骤通过检查文件是否存在来处理
-            exit 0 # 正常退出，让 workflow 继续
+            exit 0 # Exit gracefully
           fi
           echo "Found previous completed run ID: $PREVIOUS_RUN_ID"
 
           # --- 3. 查找目标 Artifact 信息 ---
           echo "Attempting to find artifact '$ARTIFACT_NAME' in run $PREVIOUS_RUN_ID..."
           ARTIFACT_API_URL="/repos/${REPO_NAME}/actions/runs/${PREVIOUS_RUN_ID}/artifacts"
-          ARTIFACT_API_OUTPUT=$(gh api "${ARTIFACT_API_URL}" -q)
+          # Step 1: Run gh api, save output. NO -q HERE.
+          ARTIFACT_API_OUTPUT=$(gh api "${ARTIFACT_API_URL}")
           ARTIFACT_API_EXIT_CODE=$?
           ARTIFACT_INFO_JSON=""
           if [ $ARTIFACT_API_EXIT_CODE -eq 0 ]; then
+              # Step 2: Run jq on the saved output
               ARTIFACT_INFO_JSON=$(echo "${ARTIFACT_API_OUTPUT}" | jq -r --arg artifact_name "$ARTIFACT_NAME" '.artifacts[] | select(.name==$artifact_name)')
           else
               echo "Warning: API call list artifacts failed (Code: $ARTIFACT_API_EXIT_CODE). Assuming no artifacts."
           fi
           if [ -z "$ARTIFACT_INFO_JSON" ] || [ "$ARTIFACT_INFO_JSON" == "[]" ]; then
              echo "Artifact '$ARTIFACT_NAME' not found in run $PREVIOUS_RUN_ID. Proceeding with default timestamp."
-             # 不需要设置 output
-             exit 0 # 正常退出
+             exit 0 # Exit gracefully
           fi
           DOWNLOAD_URL=$(echo "$ARTIFACT_INFO_JSON" | jq -r '.archive_download_url')
           ARTIFACT_ID=$(echo "$ARTIFACT_INFO_JSON" | jq -r '.id')
@@ -96,26 +102,29 @@ jobs:
           echo "Downloading artifact..."
           curl --silent --show-error --fail -L -o ./state_temp/artifact.zip "$DOWNLOAD_URL" -H "Authorization: Bearer $GH_TOKEN"
           CURL_EXIT_CODE=$?
-          if [ $CURL_EXIT_CODE -ne 0 ]; then echo "Error: curl download failed (Code: $CURL_EXIT_CODE)"; exit 0; fi # 正常退出
+          if [ $CURL_EXIT_CODE -ne 0 ]; then echo "Error: curl download failed (Code: $CURL_EXIT_CODE)"; exit 0; fi # Exit gracefully
 
           # --- 5. 解压并验证 ---
           echo "Unzipping artifact..."
-          # 先验证 zip 包是否有效
-          if ! unzip -tq ./state_temp/artifact.zip > /dev/null 2>&1; then echo "Error: Downloaded zip is invalid."; exit 0; fi
-          # 解压到 ./state 目录
+          if ! unzip -tq ./state_temp/artifact.zip > /dev/null 2>&1; then echo "Error: Downloaded zip is invalid."; exit 0; fi # Exit gracefully
+          # List zip contents (optional debug)
+          # echo "Listing contents of artifact.zip before extraction:"
+          # unzip -l ./state_temp/artifact.zip
           unzip -o ./state_temp/artifact.zip -d ./state
           UNZIP_EXIT_CODE=$?
-           if [ $UNZIP_EXIT_CODE -ne 0 ]; then echo "Error: unzip failed (Code: $UNZIP_EXIT_CODE)"; exit 0; fi
-          # 验证目标文件是否存在
+           if [ $UNZIP_EXIT_CODE -ne 0 ]; then echo "Error: unzip failed (Code: $UNZIP_EXIT_CODE)"; exit 0; fi # Exit gracefully
+          # List extracted contents (optional debug)
+          # echo "Listing contents of ./state directory after extraction:"
+          # ls -l ./state
           if [ -f ./state/timestamp.txt ]; then
              echo "Artifact successfully downloaded and unzipped."
-             # 文件存在即表示成功，不需要设置 output，后续步骤会检查文件
+             # No need to set output, next step checks file
           else
-             echo "Error: timestamp.txt not found after unzipping."; ls -l ./state; # exit 1 # 保留注释，除非确实需要在这里失败
+             echo "Error: timestamp.txt not found after unzipping."; ls -l ./state; # exit 1 # Keep commented out
           fi
-          # 清理临时文件
+          # Clean up temporary zip file
           rm -rf ./state_temp
-          
+ 
       - name: Read last processed timestamp
         id: read_state
         run: |
