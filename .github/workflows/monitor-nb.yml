@@ -68,7 +68,7 @@ jobs:
 
           # Step 2: Run jq on the saved output
           PREVIOUS_RUN_ID=$(echo "${RUNS_API_OUTPUT}" | jq -r --argjson current_run_id ${CURRENT_RUN_ID} \
-            '.workflow_runs | map(select(.id != $current_run_id and (.status == "completed"))) | sort_by(.created_at) | reverse | .[0].id // empty')
+            '.workflow_runs | map(select(.id != $current_run_id and (.status == "completed"))) | sort_by(.created_at) | reverse | .[0].id // empty' | head -n 1)
           if [ -z "$PREVIOUS_RUN_ID" ] || [ "$PREVIOUS_RUN_ID" == "null" ]; then
             echo "No previous completed run found. Proceeding with default timestamp."
             exit 0 # Exit gracefully
