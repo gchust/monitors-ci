@@ -1,0 +1,47 @@
+# .github/workflows/test-frontend.yml
+name: NocoBase Frontend Test (Triggered - No Pro Plugins)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.commit_sha || github.run_id }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch: # ONLY trigger allowed
+    inputs:
+      commit_sha:
+        description: 'The nocobase/nocobase commit SHA to checkout and test'
+        required: true
+      branch_name:
+        description: 'The branch name (for context)'
+        required: false
+        default: 'unknown-branch'
+
+permissions:
+  contents: read
+
+jobs:
+  frontend-test:
+    name: Frontend Test (Commit ${{ github.event.inputs.commit_sha }})
+    strategy:
+      matrix:
+        node_version: ['20']
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout the SPECIFIC COMMIT from nocobase/nocobase using the input
+      - name: Checkout nocobase/nocobase Commit
+        uses: actions/checkout@v4
+        with:
+          repository: nocobase/nocobase
+          ref: ${{ github.event.inputs.commit_sha }}
+
+      - name: Use Node.js ${{ matrix.node_version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node_version }}
+          cache: 'yarn'
+
+      - name: Install project dependencies
+        run: yarn install --frozen-lockfile
+      - name: Run client tests
+        run: yarn test:client # Run the same tests, but on the checked-out nocobase code
+    timeout-minutes: 30

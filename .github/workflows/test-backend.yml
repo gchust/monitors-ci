@@ -1,0 +1,124 @@
+# .github/workflows/test-backend.yml
+name: NocoBase Backend Test (Triggered - No Pro Plugins)
+
+concurrency:
+  # Use inputs in the key for dispatched runs
+  group: ${{ github.workflow }}-${{ github.event.inputs.commit_sha || github.run_id }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch: # ONLY trigger allowed
+    inputs:
+      commit_sha:
+        description: 'The nocobase/nocobase commit SHA to checkout and test'
+        required: true
+      branch_name:
+        description: 'The branch name (for context)'
+        required: false
+        default: 'unknown-branch'
+
+permissions:
+  contents: read
+
+jobs:
+  # Combine matrix jobs under a single job definition
+  backend-tests:
+    name: ${{ matrix.db_name }} Test (Commit ${{ github.event.inputs.commit_sha }})
+    strategy:
+      fail-fast: false # Allow other DB tests to continue if one fails
+      matrix:
+        # Define DB configurations in the matrix
+        db_config:
+          - { db_name: SQLite, runner: ubuntu-latest, node: 20, dialect: sqlite, service_needed: false, underscored: true }
+          - { db_name: SQLite (non-underscored), runner: ubuntu-latest, node: 20, dialect: sqlite, service_needed: false, underscored: false }
+          - { db_name: PostgreSQL, runner: ubuntu-latest, node: 20, dialect: postgres, service_needed: true, underscored: true, schema: public, collection_schema: public, cache_redis: '' }
+          - { db_name: PostgreSQL (non-underscored), runner: ubuntu-latest, node: 20, dialect: postgres, service_needed: true, underscored: false, schema: public, collection_schema: public, cache_redis: '' }
+          - { db_name: PostgreSQL (Schemas), runner: ubuntu-latest, node: 20, dialect: postgres, service_needed: true, underscored: true, schema: nocobase, collection_schema: user_schema, cache_redis: '' }
+          - { db_name: PostgreSQL (Redis Cache), runner: ubuntu-latest, node: 20, dialect: postgres, service_needed: true, underscored: true, schema: public, collection_schema: public, cache_redis: 'redis://redis:6379/0' }
+          - { db_name: MySQL, runner: ubuntu-latest, node: 20, dialect: mysql, service_needed: true, underscored: true }
+          - { db_name: MySQL (non-underscored), runner: ubuntu-latest, node: 20, dialect: mysql, service_needed: true, underscored: false }
+          - { db_name: MariaDB, runner: ubuntu-latest, node: 20, dialect: mariadb, service_needed: true, underscored: true }
+          - { db_name: MariaDB (non-underscored), runner: ubuntu-latest, node: 20, dialect: mariadb, service_needed: true, underscored: false }
+        include:
+          # Add specific service definitions based on dialect
+          - db_config: { dialect: postgres }
+            postgres_service:
+              image: postgres:11
+              env: { POSTGRES_USER: nocobase, POSTGRES_PASSWORD: password }
+              options: >-
+                --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+          - db_config: { dialect: mysql }
+            mysql_service:
+              image: mysql:8.2
+              env: { MYSQL_ROOT_PASSWORD: password, MYSQL_DATABASE: nocobase }
+              options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+          - db_config: { dialect: mariadb }
+            mariadb_service:
+              image: mariadb:10.9
+              env: { MARIADB_ROOT_PASSWORD: password, MARIADB_DATABASE: nocobase }
+              options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+          - db_config: { cache_redis: 'redis://redis:6379/0' } # Also include for postgresql redis cache test
+            redis_service:
+              image: redis/redis-stack-server:latest
+              ports: [ '6379:6379' ]
+          - db_config: { dialect: sqlite } # Add redis for sqlite too if needed by tests
+            redis_service:
+              image: redis/redis-stack-server:latest
+              ports: [ '6379:6379' ]
+
+
+    runs-on: ${{ matrix.db_config.runner }}
+    container: node:${{ matrix.db_config.node }} # Use container for consistency
+    services:
+      # Conditionally define services based on matrix flags/values
+      postgres: ${{ matrix.postgres_service }}
+      mysql: ${{ matrix.mysql_service }}
+      mariadb: ${{ matrix.mariadb_service }}
+      redis: ${{ matrix.redis_service }}
+
+    steps:
+      # Checkout the SPECIFIC COMMIT from nocobase/nocobase using the input
+      - name: Checkout nocobase/nocobase Commit
+        uses: actions/checkout@v4
+        with:
+          repository: nocobase/nocobase
+          ref: ${{ github.event.inputs.commit_sha }}
+
+      - name: Use Node.js ${{ matrix.db_config.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.db_config.node }}
+          cache: 'yarn'
+
+      - name: Install project dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Run Backend Tests (${{ matrix.db_config.dialect }})
+        # Consolidate test execution, set ENV vars based on matrix
+        run: |
+          if [[ "${{ matrix.db_config.dialect }}" == "postgres" || "${{ matrix.db_config.dialect }}" == "mysql" || "${{ matrix.db_config.dialect }}" == "mariadb" ]]; then
+            echo "Starting DB creator script..."
+            ./node_modules/.bin/tsx packages/core/test/src/scripts/test-db-creator.ts &
+            sleep 1 # Give it a moment
+          fi
+          echo "Running tests..."
+          yarn test --server --single-thread=false
+        env:
+          LOGGER_LEVEL: error
+          DB_DIALECT: ${{ matrix.db_config.dialect }}
+          # Conditional DB connection details based on dialect
+          DB_HOST: ${{ matrix.db_config.dialect == 'postgres' && 'postgres' || matrix.db_config.dialect == 'mysql' && 'mysql' || matrix.db_config.dialect == 'mariadb' && 'mariadb' || '' }}
+          DB_PORT: ${{ matrix.db_config.dialect == 'postgres' && '5432' || matrix.db_config.dialect == 'mysql' && '3306' || matrix.db_config.dialect == 'mariadb' && '3306' || '' }}
+          DB_USER: ${{ matrix.db_config.dialect == 'sqlite' && '' || matrix.db_config.dialect == 'postgres' && 'nocobase' || 'root' }}
+          DB_PASSWORD: ${{ matrix.db_config.dialect == 'sqlite' && '' || 'password' }}
+          DB_DATABASE: ${{ matrix.db_config.dialect == 'sqlite' && '' || 'nocobase' }}
+          DB_STORAGE: ${{ matrix.db_config.dialect == 'sqlite' && '/tmp/db.sqlite' || '' }}
+          # Other common ENV VARS
+          DB_UNDERSCORED: ${{ matrix.db_config.underscored }}
+          DB_SCHEMA: ${{ matrix.db_config.schema || 'public' }} # Default schema if not set
+          COLLECTION_MANAGER_SCHEMA: ${{ matrix.db_config.collection_schema || 'public' }} # Default schema if not set
+          DB_TEST_DISTRIBUTOR_PORT: 23450
+          DB_TEST_PREFIX: ${{ matrix.db_config.dialect == 'sqlite' && 'test_' || 'test' }}
+          ENCRYPTION_FIELD_KEY: 1%&glK;<UA}aIxJVc53-4G(rTi0vg@J]
+          CACHE_REDIS_URL: ${{ matrix.db_config.cache_redis || '' }} # Default empty if not set
+    timeout-minutes: 60
