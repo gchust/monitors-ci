@@ -1,52 +1,39 @@
-name: Run Nocobase E2E Tests (Triggerable)
+# .github/workflows/e2e-tests.yml
+name: Run Nocobase E2E Tests (Triggerable - No Pro Plugins)
 
 on:
   workflow_dispatch:
     inputs:
       commit_sha:
-        description: 'The commit SHA to checkout and test'
+        description: 'The nocobase/nocobase commit SHA to checkout and test'
         required: true
       branch_name:
         description: 'The branch name (for context/artifact naming)'
         required: false
         default: 'unknown-branch'
 
-# Set permissions: only needs to read contents to checkout code
 permissions:
-  contents: read
-  actions: read # Needed by actions/upload-artifact
+  contents: read    # Needed to checkout the nocobase/nocobase repo
+  actions: write    # Needed to upload/download artifacts
 
-# Concurrency specifically for E2E test runs
-# Ensures only one E2E test run is active at a time for the main target
-# You could make the group more specific if needed, e.g., per branch using inputs
 concurrency:
-  group: e2e-tests-${{ github.repository }} # Group all E2E runs for this repo together
+  group: e2e-tests-triggered-${{ github.repository }}-${{ github.event.inputs.commit_sha }}
   cancel-in-progress: true
 
 jobs:
-  run_e2e_tests:
-    name: Run Nocobase E2E Tests on ${{ github.event.inputs.commit_sha }}
+  build:
+    name: Build Nocobase Commit ${{ github.event.inputs.commit_sha }}
     runs-on: ubuntu-latest
-    container: node:18
-    services:
-      postgres:
-        image: postgres:11
-        env:
-          POSTGRES_USER: nocobase
-          POSTGRES_PASSWORD: password
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
+    outputs:
+      build_artifact_name: build-artifact-${{ github.run_id }}
     steps:
       # Checkout the specific commit from nocobase/nocobase passed via input
-      - name: Checkout nocobase/nocobase code on specific commit
+      - name: Checkout nocobase/nocobase code
         uses: actions/checkout@v4
         with:
           repository: nocobase/nocobase # Target repository
           ref: ${{ github.event.inputs.commit_sha }} # Use the SHA from the input
+          # No token needed for public repo checkout
 
       # Setup Node.js environment
       - name: Use Node.js 18
@@ -58,12 +45,12 @@ jobs:
       # Get yarn cache directory path (needed for caching step)
       - name: Get yarn cache directory path
         id: yarn-cache-dir-path
-        run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT # Use GITHUB_OUTPUT
+        run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT
 
       # Setup caching for yarn dependencies
       - name: Cache yarn dependencies
         uses: actions/cache@v4
-        id: yarn-cache # Optional: Cache step ID
+        id: yarn-cache
         with:
           path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
           key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
@@ -80,32 +67,249 @@ jobs:
         env:
           __E2E__: true # Set environment variable needed during build for E2E
 
-      # Install Playwright browsers required for tests
+      # Upload build artifacts (es, lib, dist directories excluding node_modules)
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact-${{ github.run_id }} # Use run ID for uniqueness
+          path: |
+            packages/**/es/
+            packages/**/lib/
+            packages/**/dist/
+            !packages/**/node_modules/**
+          retention-days: 1 # Keep build artifact only for a short time
+
+  test-core:
+    name: Test Core E2E
+    needs: build
+    runs-on: ubuntu-latest
+    container: node:18
+    services:
+      postgres:
+        image: postgres:11
+        env:
+          POSTGRES_USER: nocobase
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      # Checkout the specific commit from nocobase/nocobase
+      - name: Checkout nocobase/nocobase code
+        uses: actions/checkout@v4
+        with:
+          repository: nocobase/nocobase
+          ref: ${{ github.event.inputs.commit_sha }}
+
+      # Setup Node.js (needed again in container)
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          # No cache setup needed here as we download artifacts
+
+      # Download build artifact
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.build_artifact_name }}
+          path: . # Download to the root
+
+      # Get yarn cache dir and cache (for install step)
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT
+      - name: Cache yarn dependencies
+        uses: actions/cache@v4
+        id: yarn-cache
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }} # Key should match build job
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      # Install dependencies (needed for test runner)
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      # Install Playwright browsers
       - name: Install Playwright browsers
         run: npx playwright install chromium --with-deps
 
-      # Execute the E2E tests
-      - name: Run E2E tests (Core and Plugins - adapted)
+      # Execute the Core E2E tests (excluding data-source-main and workflow related which might be pro)
+      - name: Run Core E2E tests
+        # This command is adapted from the original core-and-plugins job's ignore pattern
+        # It aims to run everything *except* specific plugins often found in pro-plugins
         run: yarn e2e p-test --ignore 'packages/**/{plugin-data-source-main,plugin-workflow,plugin-workflow-*}/**/__e2e__/**/*.test.ts'
         env:
-          # Set environment variables required by the tests
           __E2E__: true
           APP_ENV: production
           LOGGER_LEVEL: error
           DB_DIALECT: postgres
-          DB_HOST: postgres # Use the service name defined above
+          DB_HOST: postgres # Use the service name
           DB_PORT: 5432
           DB_USER: nocobase
           DB_PASSWORD: password
           DB_DATABASE: nocobase
-          ENCRYPTION_FIELD_KEY: 1%&glK;<UA}aIxJVc53-4G(rTi0vg@J] # Use a placeholder or manage securely if needed for tests
+          # APPEND_PRESET_LOCAL_PLUGINS: removed - no pro plugins
+          ENCRYPTION_FIELD_KEY: 1%&glK;<UA}aIxJVc53-4G(rTi0vg@J] # Placeholder key
 
-      # Optional: Upload E2E test reports as artifacts for review
-      - name: Upload E2E test report artifact
-        # Run this step even if the previous test step failed, to capture failure reports
+      # Upload E2E test report for this job
+      - name: Upload Core E2E report artifact
+        if: always() # Upload even if tests fail
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report-core-${{ github.run_id }}
+          path: ./storage/playwright/tests-report-blob/blob-*/*
+          retention-days: 7
+
+  test-data-source-main:
+    name: Test Data Source Main E2E
+    needs: build
+    runs-on: ubuntu-latest
+    container: node:18
+    services:
+      postgres:
+        image: postgres:11
+        env:
+          POSTGRES_USER: nocobase
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      # Checkout the specific commit from nocobase/nocobase
+      - name: Checkout nocobase/nocobase code
+        uses: actions/checkout@v4
+        with:
+          repository: nocobase/nocobase
+          ref: ${{ github.event.inputs.commit_sha }}
+
+      # Setup Node.js
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      # Download build artifact
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.build_artifact_name }}
+          path: .
+
+      # Get yarn cache dir and cache
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT
+      - name: Cache yarn dependencies
+        uses: actions/cache@v4
+        id: yarn-cache
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      # Install dependencies
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      # Install Playwright browsers
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+
+      # Execute the Data Source Main E2E tests
+      - name: Run Data Source Main E2E tests
+        # This command is adapted from the original plugin-data-source-main job
+        run: yarn e2e p-test --match 'packages/**/plugin-data-source-main/**/__e2e__/**/*.test.ts'
+        env:
+          __E2E__: true
+          APP_ENV: production
+          LOGGER_LEVEL: error
+          DB_DIALECT: postgres
+          DB_HOST: postgres
+          DB_PORT: 5432
+          DB_USER: nocobase
+          DB_PASSWORD: password
+          DB_DATABASE: nocobase
+          # APPEND_PRESET_LOCAL_PLUGINS: removed - no pro plugins
+          ENCRYPTION_FIELD_KEY: 1%&glK;<UA}aIxJVc53-4G(rTi0vg@J]
+
+      # Upload E2E test report for this job
+      - name: Upload Data Source Main E2E report artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-report-${{ github.event.inputs.branch_name }}-${{ github.event.inputs.commit_sha }}-${{ github.run_id }}
-          path: ./storage/playwright/tests-report-blob/blob-*/* # Path to Playwright reports in nocobase structure
-          retention-days: 7 # Keep reports for 7 days
+          name: e2e-report-ds-main-${{ github.run_id }}
+          path: ./storage/playwright/tests-report-blob/blob-*/*
+          retention-days: 7
+
+  report:
+    name: Generate E2E Report
+    needs: [test-core, test-data-source-main]
+    runs-on: ubuntu-latest
+    if: always() # Run even if upstream jobs fail to generate the report
+    steps:
+      # Checkout the code of THIS repo to get the merge script if needed
+      - name: Checkout current repo code
+        uses: actions/checkout@v4
+
+      # Setup Node.js for the merge script
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'yarn'
+
+      # Install dependencies (only if merge script needs them, check script content)
+      # Assuming yarn install is needed for playwright merge command
+      - run: yarn install --frozen-lockfile
+
+      # Download all report artifacts
+      - name: Download all E2E report artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: e2e-report # Download all artifacts matching the pattern into this folder
+          pattern: e2e-report-* # Match artifacts from both test jobs
+          merge-multiple: true # Merge artifacts with the same name pattern
+
+      # Check if merge script exists and run it (adapt path if necessary)
+      # The original workflow used 'scripts/moveE2EReportFiles.js' and 'playwright merge-reports'
+      - name: Check for merge script and report files
+        id: check_files
+        run: |
+          if [ -f "scripts/moveE2EReportFiles.js" ]; then
+            echo "merge_script_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "merge_script_exists=false" >> $GITHUB_OUTPUT
+            echo "Merge script 'scripts/moveE2EReportFiles.js' not found in this repo."
+          fi
+          if [ -d "e2e-report" ] && [ "$(ls -A e2e-report)" ]; then
+             echo "reports_exist=true" >> $GITHUB_OUTPUT
+          else
+             echo "reports_exist=false" >> $GITHUB_OUTPUT
+             echo "No report files found in e2e-report directory."
+          fi
+
+      - name: Merge reports if script and files exist
+        if: steps.check_files.outputs.merge_script_exists == 'true' && steps.check_files.outputs.reports_exist == 'true'
+        # Adapt the command based on the actual script and playwright config location in YOUR repo
+        run: |
+          node scripts/moveE2EReportFiles.js && npx playwright merge-reports --config .github/workflows/merge.config.ts ./e2e-report # Assuming merge config is also present
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+
+      # Upload the merged HTML report
+      - name: Upload final E2E HTML report
+        if: steps.check_files.outputs.reports_exist == 'true' # Only upload if reports were downloaded
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-e2e-html-report-${{ github.event.inputs.branch_name }}-${{ github.event.inputs.commit_sha }}
+          # Adjust path based on where the merge command outputs the report
+          path: ./e2e-html-report/index.html # Default path from original workflow
+          retention-days: 14

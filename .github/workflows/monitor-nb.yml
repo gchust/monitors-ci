@@ -279,17 +279,43 @@ jobs:
           retention-days: 90 # Keep state artifacts for a reasonable time
 
       # --- Trigger the E2E Test Workflow ---
-      - name: Trigger E2E Test Workflow
-        if: steps.check_commit.outputs.triggered == 'true' # Only run if a new commit was found
+      - name: Trigger Test Workflows
+        if: steps.check_commit.outputs.triggered == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Use secrets.GITHUB_TOKEN for gh cli auth
           COMMIT_SHA: ${{ steps.check_commit.outputs.sha }}
           BRANCH_NAME: ${{ steps.check_commit.outputs.branch }}
+          TARGET_REPO: ${{ github.repository }} # The repo where workflows live (e.g., your-user/your-repo)
+          TARGET_REF: ${{ github.ref_name }} # The ref in your repo to run the workflow from
         run: |
-          echo "Triggering E2E test workflow (e2e-tests.yml) for commit $COMMIT_SHA on branch $BRANCH_NAME..."
+          echo "Triggering test workflows for commit $COMMIT_SHA on branch $BRANCH_NAME..."
+
+          echo "Triggering e2e-tests.yml..."
           gh workflow run e2e-tests.yml \
-            -R ${{ github.repository }} \
-            -r ${{ github.ref_name }} \
+            -R $TARGET_REPO \
+            -r $TARGET_REF \
             -f commit_sha="$COMMIT_SHA" \
             -f branch_name="$BRANCH_NAME"
-          echo "Workflow trigger command sent."
+
+          echo "Triggering test-backend.yml..."
+          gh workflow run test-backend.yml \
+            -R $TARGET_REPO \
+            -r $TARGET_REF \
+            -f commit_sha="$COMMIT_SHA" \
+            -f branch_name="$BRANCH_NAME"
+
+          echo "Triggering test-frontend.yml..."
+          gh workflow run test-frontend.yml \
+            -R $TARGET_REPO \
+            -r $TARGET_REF \
+            -f commit_sha="$COMMIT_SHA" \
+            -f branch_name="$BRANCH_NAME"
+
+          echo "Triggering test-windows.yml..."
+          gh workflow run test-windows.yml \
+            -R $TARGET_REPO \
+            -r $TARGET_REF \
+            -f commit_sha="$COMMIT_SHA" \
+            -f branch_name="$BRANCH_NAME"
+
+          echo "Workflow trigger commands sent."

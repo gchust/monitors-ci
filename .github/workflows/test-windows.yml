@@ -1,0 +1,52 @@
+# .github/workflows/test-windows.yml
+name: Test on Windows (Triggered - No Pro Plugins)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.commit_sha || github.run_id }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch: # ONLY trigger allowed
+    inputs:
+      commit_sha:
+        description: 'The nocobase/nocobase commit SHA to checkout and test'
+        required: true
+      branch_name:
+        description: 'The branch name (for context)'
+        required: false
+        default: 'unknown-branch'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-test:
+    name: Windows Test (Commit ${{ github.event.inputs.commit_sha }})
+    runs-on: windows-2022
+    steps:
+      # Checkout the SPECIFIC COMMIT from nocobase/nocobase using the input
+      - name: Checkout nocobase/nocobase Commit
+        uses: actions/checkout@v4
+        with:
+          repository: nocobase/nocobase
+          ref: ${{ github.event.inputs.commit_sha }}
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'yarn'
+
+      - name: Install project dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Test with Sqlite on Windows
+        run: yarn test --server --single-thread=false # Run same tests on checked-out code
+        env:
+          LOGGER_LEVEL: error
+          DB_DIALECT: sqlite
+          DB_STORAGE: 'C:/Users/runneradmin/AppData/Local/Temp/db.sqlite' # Adjusted path
+          DB_TEST_PREFIX: test_
+          DB_UNDERSCORED: true # Match original setup for windows test
+          ENCRYPTION_FIELD_KEY: 1%&glK;<UA}aIxJVc53-4G(rTi0vg@J]
+    timeout-minutes: 45
