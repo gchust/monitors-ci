@@ -289,6 +289,7 @@ jobs:
           echo "Triggering E2E test workflow (e2e-tests.yml) for commit $COMMIT_SHA on branch $BRANCH_NAME..."
           gh workflow run e2e-tests.yml \
             -R ${{ github.repository }} \
+            -r ${{ github.ref_name }} \
             -f commit_sha="$COMMIT_SHA" \
             -f branch_name="$BRANCH_NAME"
           echo "Workflow trigger command sent."
